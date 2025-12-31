@@ -1,0 +1,13 @@
+.env
+.env.*
+postgres-data/
+metabase-data/
+data/
+logs/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.vscode/
+.ipynb_checkpoints/
+*.bak.*

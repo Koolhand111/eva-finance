@@ -1,0 +1,79 @@
+
+
+services:
+  services:
+  db:
+    image: postgres:16
+    container_name: eva_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - eva_db_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - eva_net
+
+  eva-api:
+    build: ./eva-api
+    container_name: eva_api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    depends_on:
+      - db
+    ports:
+      - "9080:8080"
+    networks:
+      - eva_net
+
+  eva-worker:
+    build: ./eva-worker
+    container_name: eva_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - db
+    networks:
+      - eva_net
+    
+  metabase:
+    image: metabase/metabase:latest
+    container_name: eva_metabase
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: eva_finance
+      MB_DB_PORT: 5432
+      MB_DB_USER: eva
+      MB_DB_PASS: eva_password_change_me
+      MB_DB_HOST: db
+    depends_on:
+      - db
+    networks:
+      - eva_net
+
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: eva_ntfy
+    restart: unless-stopped
+    command: serve --listen-http :80
+    ports:
+      - "8085:80"
+    networks:
+      - eva_net   
+    
+
+volumes:
+  eva_db_data:
+  ntfy_cache:
+  ntfy_config:
+
+networks:
+  eva_net:
+    driver: bridge
