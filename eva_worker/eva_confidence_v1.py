@@ -104,6 +104,10 @@ def main():
             tag = r["tag"]
             brand = r["brand"]
 
+            # Skip candidates with NULL or empty brand/tag (not actionable for recommendations)
+            if brand is None or brand == '' or tag is None or tag == '':
+                continue
+
             delta_pct = float(r["delta_pct"])
             msg_count = int(r["msg_count"])
             source_count = int(r["source_count"])
