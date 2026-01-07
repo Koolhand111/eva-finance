@@ -65,8 +65,11 @@ services:
     ports:
       - "8085:80"
     networks:
-      - eva_net   
-    
+      - eva_net
+
+  # Note: n8n is running externally and connected to eva_net
+  # Access at http://localhost:5678
+
 
 volumes:
   eva_db_data:

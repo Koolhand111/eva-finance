@@ -1,0 +1,322 @@
+{
+  "name": "EVA Reddit Ingestion - Posts Only",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule Every 15min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Create list of subreddits to monitor\nreturn [\n  { subreddit: 'BuyItForLife' },\n  { subreddit: 'Frugal' },\n  { subreddit: 'running' }\n];"
+      },
+      "id": "create-subreddit-list",
+      "name": "Create Subreddit List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "split-subreddits",
+      "name": "Split Subreddits",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.reddit.com/r/{{ $json.subreddit }}/new.json?limit=25",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "EVA-Finance/1.0 (Reddit ingestion)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "fetch-reddit-posts",
+      "name": "HTTP: Fetch Posts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Extract posts from Reddit API response\nconst response = $input.all()[0].json;\n\nif (!response || !response.data || !response.data.children) {\n  console.log('No posts found or invalid response');\n  return [];\n}\n\nconst posts = response.data.children\n  .map(child => child.data)\n  .filter(post => {\n    // Only include text posts with actual content\n    const hasText = post.selftext && post.selftext.trim().length > 0;\n    const notDeleted = post.selftext !== '[removed]' && post.selftext !== '[deleted]';\n    return hasText && notDeleted;\n  })\n  .map(post => ({\n    reddit_id: post.id,\n    subreddit: post.subreddit,\n    title: post.title,\n    selftext: post.selftext,\n    created_utc: post.created_utc,\n    author: post.author,\n    url: post.url,\n    permalink: post.permalink\n  }));\n\nconsole.log(`Extracted ${posts.length} text posts from r/${posts[0]?.subreddit || 'unknown'}`);\nreturn posts;"
+      },
+      "id": "extract-posts",
+      "name": "Code: Extract Posts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "split-posts",
+      "name": "Split Posts",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Format post for EVA ingestion\nconst post = $input.all()[0].json;\n\n// Combine title + selftext for better context\nconst fullText = `${post.title}\\n\\n${post.selftext}`;\n\n// Format timestamp (Reddit uses Unix timestamp)\nconst timestamp = new Date(post.created_utc * 1000).toISOString();\n\nreturn [{\n  json: {\n    source: 'reddit',\n    platform_id: `reddit_post_${post.reddit_id}`,\n    timestamp: timestamp,\n    text: fullText,\n    metadata: {\n      subreddit: post.subreddit,\n      author: post.author,\n      url: `https://www.reddit.com${post.permalink}`\n    }\n  }\n}];"
+      },
+      "id": "format-for-eva",
+      "name": "Code: Format for EVA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://eva-api:9080/intake/message",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "source",
+              "value": "={{ $json.source }}"
+            },
+            {
+              "name": "platform_id",
+              "value": "={{ $json.platform_id }}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "text",
+              "value": "={{ $json.text }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "post-to-eva",
+      "name": "HTTP: POST to EVA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1780,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "multiplex"
+      },
+      "id": "merge-posts-loop",
+      "name": "Merge Posts Loop",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2000,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "multiplex"
+      },
+      "id": "merge-subreddits-loop",
+      "name": "Merge Subreddits Loop",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2220,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Every 15min": {
+      "main": [
+        [
+          {
+            "node": "Create Subreddit List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Subreddit List": {
+      "main": [
+        [
+          {
+            "node": "Split Subreddits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Subreddits": {
+      "main": [
+        [],
+        [
+          {
+            "node": "HTTP: Fetch Posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: Fetch Posts": {
+      "main": [
+        [
+          {
+            "node": "Code: Extract Posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code: Extract Posts": {
+      "main": [
+        [
+          {
+            "node": "Split Posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Posts": {
+      "main": [
+        [
+          {
+            "node": "Merge Subreddits Loop",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code: Format for EVA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code: Format for EVA": {
+      "main": [
+        [
+          {
+            "node": "HTTP: POST to EVA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: POST to EVA": {
+      "main": [
+        [
+          {
+            "node": "Merge Posts Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Posts Loop": {
+      "main": [
+        [
+          {
+            "node": "Split Posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Subreddits Loop": {
+      "main": [
+        [
+          {
+            "node": "Split Subreddits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2026-01-07T16:30:00.000Z",
+  "versionId": "1"
+}
