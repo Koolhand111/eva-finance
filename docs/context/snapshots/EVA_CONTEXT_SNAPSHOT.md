@@ -52,46 +52,48 @@ WHAT IS WORKING (END-TO-END)
 - worker.py automatic extraction (LLM + heuristic fallback) → processed_messages
 - worker.py trigger emission (TAG_ELEVATED, BRAND_DIVERGENCE) → signal_events
 - Manual eva_confidence_v1.py scoring → eva_confidence_v1 table + RECOMMENDATION_ELIGIBLE events
-- Manual generate.py --event-id <id> → evidence bundle + markdown recommendation
+- Manual generate.py --event-id <id> → evidence bundle + markdown recommendation + recommendation_drafts record
+- Automatic recommendation_drafts insertion after artifact creation (idempotent via ON CONFLICT)
 - DB schema migrations (init.sql, 002_add_notification_approval.sql)
 
 WHAT IS PARTIALLY WORKING
 
 - n8n workflows exist (eva_worker/n8n.json) but not deployed/tested
 - n8n notification polling queries (db/migrations/n8n_notification_queries.sql) defined but not integrated
-- recommendation_drafts table exists but not auto-populated (manual INSERT only)
 - ntfy container running but no automated notifications wired up
 - Retry logic for failed notifications (notify_attempts, last_notify_error) defined but not tested
 
 KNOWN ISSUES / BUGS
 
-- No automated insertion into recommendation_drafts after generate.py runs
 - eva_confidence_v1.py hardcoded to score only current_date candidates (misses multi-day accumulation)
 - n8n notification polling not yet integrated with recommendation_drafts table
 
 CURRENT FOCAL PROBLEM
 
-Package structure cleanup complete (commit 0829675). Dual structure implemented: legacy worker.py, scoring.py, eva_confidence_v1.py remain in eva_worker/ root for container compatibility; new generation code in eva_worker/eva_worker/ package. Container verified working. Next focus: wire generate.py to auto-insert recommendation_drafts and integrate n8n notification polling.
+Auto-insertion into recommendation_drafts complete. generate.py now automatically creates recommendation_drafts records after artifact generation (idempotent via ON CONFLICT). Next focus: integrate n8n notification polling workflow to query recommendation_drafts.notify_ready=true and send notifications via ntfy.
 
 RECENT CHANGES
 
-Last commit (0829675): Refactor project structure and add database migrations
-- Restructured worker component: moved eva-worker/ to eva_worker/ (dual structure: legacy root files + new package)
-- Added db/migrations/ directory (002_add_notification_approval.sql, n8n notification queries/workflow)
-- Added docs/context/snapshots/ (engineering snapshot documentation)
-- Added eva_worker/eva_worker/ package (generate.py, render.py, sanitize.py, hashutil.py, reco_runner.py)
-- Updated docker-compose.yml (build path: ./eva_worker)
-- Updated Project_Map.md (reflects new package structure)
-- Container verified working (Python 3.12.12, psycopg2 available, worker.py running)
+Last commit (886a7ce): Update context snapshot after package structure commit
+- Updated EVA_CONTEXT_SNAPSHOT.md with completed package structure cleanup
+- Marked package structure and container verification as complete
+
+Current uncommitted work:
+- Modified eva_worker/eva_worker/generate.py: added _insert_recommendation_draft() function
+- Auto-insertion into recommendation_drafts after artifact creation (idempotent via ON CONFLICT)
+- Returns draft_id in generate_from_db() response
+- Tested end-to-end: artifacts + draft creation verified working
+- Container rebuilt and restarted with updated code
 
 NEXT STEPS (ORDERED)
 
 1. ✅ COMPLETE: Commit package structure changes (commit 0829675)
 2. ✅ COMPLETE: Verify container works after restructure (container running, Python 3.12.12, dependencies OK)
-3. Wire generate.py output to auto-insert recommendation_drafts row after artifact creation
+3. ✅ COMPLETE: Wire generate.py output to auto-insert recommendation_drafts row after artifact creation
 4. Test n8n workflow import (eva_worker/n8n.json) and notification polling queries
-5. Implement automated INSERT into recommendation_drafts after generate_from_db() completes
-6. Consider migrating legacy worker.py/scoring.py/eva_confidence_v1.py into eva_worker/eva_worker/ package (optional cleanup)
+5. Integrate n8n notification polling with recommendation_drafts table
+6. Test ntfy notification delivery end-to-end
+7. Consider migrating legacy worker.py/scoring.py/eva_confidence_v1.py into eva_worker/eva_worker/ package (optional cleanup)
 
 INVARIANTS / RULES
 

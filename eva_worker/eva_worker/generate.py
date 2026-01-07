@@ -310,12 +310,75 @@ def _build_evidence_items(evidence_rows: List[Dict[str, Any]]) -> List[Dict[str,
     return items
 
 
+def _insert_recommendation_draft(
+    signal_event_id: int,
+    event_type: str,
+    brand: str,
+    tag: Optional[str],
+    event_time: datetime,
+    confidence_snapshot_id: Optional[int],
+    confidence_computed_at: Optional[datetime],
+    final_confidence: Optional[float],
+    band: Optional[str],
+    bundle_path: str,
+    bundle_sha256: str,
+    markdown_path: str,
+) -> Optional[int]:
+    """
+    Insert a new recommendation draft record for human approval.
+    Uses ON CONFLICT to make idempotent (if signal_event_id already exists, skip).
+    Returns the draft id if inserted, None if already exists.
+    """
+    conn, cursor_cls = _connect_pg()
+
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=cursor_cls) as cur:
+                cur.execute("""
+                    INSERT INTO recommendation_drafts (
+                        signal_event_id, event_type, brand, tag, event_time,
+                        confidence_snapshot_id, confidence_computed_at, final_confidence, band,
+                        bundle_path, bundle_sha256, markdown_path,
+                        notify_ready, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s
+                    )
+                    ON CONFLICT (signal_event_id) DO NOTHING
+                    RETURNING id
+                """, (
+                    signal_event_id, event_type, brand, tag, event_time,
+                    confidence_snapshot_id, confidence_computed_at, final_confidence, band,
+                    bundle_path, bundle_sha256, markdown_path,
+                    False,  # notify_ready - requires human approval
+                    datetime.now(timezone.utc)
+                ))
+
+                result = cur.fetchone()
+                if result:
+                    draft_id = result["id"]
+                    print(f"✓ Created recommendation_draft id={draft_id} for signal_event_id={signal_event_id}")
+                    return draft_id
+                else:
+                    print(f"ℹ recommendation_draft already exists for signal_event_id={signal_event_id}")
+                    return None
+
+    except Exception as e:
+        print(f"✗ Failed to insert recommendation_draft for signal_event_id={signal_event_id}: {e}")
+        raise
+    finally:
+        conn.close()
+
+
 def generate_from_db(event_id: int, evidence_limit: int = DEFAULT_EVIDENCE_LIMIT, force: bool = False) -> Dict[str, Any]:
 
     """
     Main entrypoint (DB mode). Generates:
       - evidence bundle (.json.gz) [append-only]
       - recommendation markdown (.md)
+      - recommendation_drafts record (human approval gate)
     """
     anchor, snapshot, evidence_rows = _load_from_db(event_id, evidence_limit)
 
@@ -424,6 +487,28 @@ def generate_from_db(event_id: int, evidence_limit: int = DEFAULT_EVIDENCE_LIMIT
         _ensure_append_only(md_path, force=force)
     md_path.write_text(md, encoding="utf-8")
 
+    # Insert recommendation draft for human approval
+    draft_id: Optional[int] = None
+    try:
+        draft_id = _insert_recommendation_draft(
+            signal_event_id=anchor.get("signal_event_id"),
+            event_type=anchor.get("event_type"),
+            brand=anchor.get("brand"),
+            tag=anchor.get("tag"),
+            event_time=event_time,
+            confidence_snapshot_id=snapshot.get("id") if snapshot else None,
+            confidence_computed_at=snapshot.get("computed_at") if snapshot else None,
+            final_confidence=float(snapshot.get("final_confidence")) if snapshot and snapshot.get("final_confidence") is not None else None,
+            band=snapshot.get("band") if snapshot else None,
+            bundle_path=str(bundle_path),
+            bundle_sha256=bundle_sha,
+            markdown_path=str(md_path),
+        )
+    except Exception as e:
+        # Log warning but don't fail the artifact generation
+        print(f"⚠ WARNING: Artifacts created successfully but draft insertion failed: {e}")
+        print(f"  You may need to manually insert into recommendation_drafts for signal_event_id={anchor.get('signal_event_id')}")
+
     return {
         "signal_event_id": anchor.get("signal_event_id"),
         "event_type": anchor.get("event_type"),
@@ -438,6 +523,7 @@ def generate_from_db(event_id: int, evidence_limit: int = DEFAULT_EVIDENCE_LIMIT
         "bundle_path": str(bundle_path),
         "bundle_sha256": bundle_sha,
         "markdown_path": str(md_path),
+        "draft_id": draft_id,
     }
 
 
