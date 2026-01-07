@@ -65,34 +65,33 @@ WHAT IS PARTIALLY WORKING
 
 KNOWN ISSUES / BUGS
 
-- eva_worker/Dockerfile, requirements.txt, worker.py, scoring.py, eva_confidence_v1.py in root eva_worker/ are stale (deleted in git diff but not committed)
-- Active code is in eva_worker/eva_worker/ package, but worker.py still runs from root
-- docker-compose.yml references eva_worker/ build context (needs alignment with package structure)
 - No automated insertion into recommendation_drafts after generate.py runs
 - eva_confidence_v1.py hardcoded to score only current_date candidates (misses multi-day accumulation)
+- n8n notification polling not yet integrated with recommendation_drafts table
 
 CURRENT FOCAL PROBLEM
 
-Codebase directory structure is split between eva_worker/ root files (worker.py, scoring.py, eva_confidence_v1.py) and eva_worker/eva_worker/ package (generate.py, render.py, sanitize.py, hashutil.py). Git diff shows root files deleted but uncommitted. This blocks clean containerization and packaging. Need to finalize which structure is canonical and commit cleanup.
+Package structure cleanup complete (commit 0829675). Dual structure implemented: legacy worker.py, scoring.py, eva_confidence_v1.py remain in eva_worker/ root for container compatibility; new generation code in eva_worker/eva_worker/ package. Container verified working. Next focus: wire generate.py to auto-insert recommendation_drafts and integrate n8n notification polling.
 
 RECENT CHANGES
 
-Last commit (b522998): Complete initial DB schema for EVA-Finance (added init.sql, views, indexes)
-Uncommitted changes:
-- Modified Project_Map.md (key files updated to reflect new package structure)
-- Modified docker-compose.yml (build path for eva-worker)
-- Deleted eva-worker/Dockerfile, requirements.txt, worker.py, scoring.py, eva_confidence_v1.py (root files)
-- Added db/migrations/ directory (002_add_notification_approval.sql, n8n queries)
-- Added docs/context/snapshots/ (this snapshot file)
-- Added eva_worker/eva_worker/ package (generate.py, render.py, sanitize.py, hashutil.py)
+Last commit (0829675): Refactor project structure and add database migrations
+- Restructured worker component: moved eva-worker/ to eva_worker/ (dual structure: legacy root files + new package)
+- Added db/migrations/ directory (002_add_notification_approval.sql, n8n notification queries/workflow)
+- Added docs/context/snapshots/ (engineering snapshot documentation)
+- Added eva_worker/eva_worker/ package (generate.py, render.py, sanitize.py, hashutil.py, reco_runner.py)
+- Updated docker-compose.yml (build path: ./eva_worker)
+- Updated Project_Map.md (reflects new package structure)
+- Container verified working (Python 3.12.12, psycopg2 available, worker.py running)
 
 NEXT STEPS (ORDERED)
 
-1. Commit uncommitted changes (finalize eva_worker package structure, remove stale root files)
-2. Update Dockerfile and requirements.txt in eva_worker/eva_worker/ or eva_worker/ (align with package structure)
+1. ✅ COMPLETE: Commit package structure changes (commit 0829675)
+2. ✅ COMPLETE: Verify container works after restructure (container running, Python 3.12.12, dependencies OK)
 3. Wire generate.py output to auto-insert recommendation_drafts row after artifact creation
 4. Test n8n workflow import (eva_worker/n8n.json) and notification polling queries
 5. Implement automated INSERT into recommendation_drafts after generate_from_db() completes
+6. Consider migrating legacy worker.py/scoring.py/eva_confidence_v1.py into eva_worker/eva_worker/ package (optional cleanup)
 
 INVARIANTS / RULES
 
@@ -163,8 +162,8 @@ ENVIRONMENT
 
 STATUS
 
-Docker services running (19h uptime). DB schema complete. Worker extracting and emitting triggers. Scoring and recommendation generation manual. Notification pipeline defined but not wired. Uncommitted cleanup blocks packaging.
+Docker services running. DB schema complete. Package structure committed (dual structure: legacy root + new package). Container verified working (Python 3.12.12, dependencies OK). Worker extracting and emitting triggers. Scoring and recommendation generation manual. Notification pipeline defined but not wired. Next: auto-insert recommendation_drafts after generation.
 
 LAST UPDATED
 
-2026-01-06
+2026-01-07 (post-commit 0829675, container verified)
