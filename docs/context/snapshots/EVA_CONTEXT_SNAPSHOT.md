@@ -54,7 +54,9 @@ WHAT IS WORKING (END-TO-END)
 - Manual eva_confidence_v1.py scoring → eva_confidence_v1 table + RECOMMENDATION_ELIGIBLE events
 - Manual generate.py --event-id <id> → evidence bundle + markdown recommendation + recommendation_drafts record
 - Automatic recommendation_drafts insertion after artifact creation (idempotent via ON CONFLICT)
-- DB schema migrations (init.sql, 002_add_notification_approval.sql)
+- AI approval agent evaluates recommendations and sets notify_ready flag automatically
+- LLM-based quality assessment with reasoning (falls back to rule-based if API unavailable)
+- DB schema migrations (init.sql, 002_add_notification_approval.sql, 003_add_ai_approval_fields.sql)
 
 WHAT IS PARTIALLY WORKING
 
@@ -70,30 +72,35 @@ KNOWN ISSUES / BUGS
 
 CURRENT FOCAL PROBLEM
 
-Auto-insertion into recommendation_drafts complete. generate.py now automatically creates recommendation_drafts records after artifact generation (idempotent via ON CONFLICT). Next focus: integrate n8n notification polling workflow to query recommendation_drafts.notify_ready=true and send notifications via ntfy.
+AI approval agent complete. generate.py now automatically evaluates recommendations using LLM (or rule-based fallback) and sets notify_ready flag based on quality assessment. Approval reasoning and confidence stored in database for audit trail. Next focus: integrate n8n notification polling workflow to query recommendation_drafts.notify_ready=true and send notifications via ntfy.
 
 RECENT CHANGES
 
-Last commit (886a7ce): Update context snapshot after package structure commit
-- Updated EVA_CONTEXT_SNAPSHOT.md with completed package structure cleanup
-- Marked package structure and container verification as complete
+Last commit (a16a5a6): Auto-insert recommendation_drafts after artifact generation
+- Added _insert_recommendation_draft() function to generate.py
+- Auto-insertion into recommendation_drafts table after creating artifacts
+- Idempotency via ON CONFLICT (signal_event_id)
+- Returns draft_id in generate_from_db() response
 
 Current uncommitted work:
-- Modified eva_worker/eva_worker/generate.py: added _insert_recommendation_draft() function
-- Auto-insertion into recommendation_drafts after artifact creation (idempotent via ON CONFLICT)
-- Returns draft_id in generate_from_db() response
-- Tested end-to-end: artifacts + draft creation verified working
-- Container rebuilt and restarted with updated code
+- Added db/migrations/003_add_ai_approval_fields.sql (approval_method, approval_reasoning, approval_confidence, approval_completed_at)
+- Created eva_worker/eva_worker/ai_approval.py (LLM-based quality evaluation)
+- Modified generate.py: integrated AI approval before draft insertion
+- AI evaluates recommendations, sets notify_ready flag automatically
+- Falls back to rule-based approval if OpenAI API unavailable
+- Tested end-to-end: AI approval evaluation runs, database fields populated
+- Container rebuilt and restarted with AI approval code
 
 NEXT STEPS (ORDERED)
 
 1. ✅ COMPLETE: Commit package structure changes (commit 0829675)
 2. ✅ COMPLETE: Verify container works after restructure (container running, Python 3.12.12, dependencies OK)
-3. ✅ COMPLETE: Wire generate.py output to auto-insert recommendation_drafts row after artifact creation
-4. Test n8n workflow import (eva_worker/n8n.json) and notification polling queries
-5. Integrate n8n notification polling with recommendation_drafts table
-6. Test ntfy notification delivery end-to-end
-7. Consider migrating legacy worker.py/scoring.py/eva_confidence_v1.py into eva_worker/eva_worker/ package (optional cleanup)
+3. ✅ COMPLETE: Wire generate.py output to auto-insert recommendation_drafts row after artifact creation (commit a16a5a6)
+4. ✅ COMPLETE: Implement AI approval agent for automatic quality evaluation
+5. Test n8n workflow import (eva_worker/n8n.json) and notification polling queries
+6. Integrate n8n notification polling with recommendation_drafts table
+7. Test ntfy notification delivery end-to-end
+8. Consider migrating legacy worker.py/scoring.py/eva_confidence_v1.py into eva_worker/eva_worker/ package (optional cleanup)
 
 INVARIANTS / RULES
 

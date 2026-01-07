@@ -10,6 +10,7 @@ from decimal import Decimal
 from .hashutil import sha256_hex
 from .render import render_markdown
 from .sanitize import sanitize_text
+from .ai_approval import evaluate_recommendation
 
 GENERATOR_VERSION = os.getenv("EVA_WORKER_VERSION", "dev")
 OUTPUT_ROOT = Path(os.getenv("EVA_RECO_OUTPUT_DIR", "eva_worker/output/recommendations"))
@@ -323,9 +324,13 @@ def _insert_recommendation_draft(
     bundle_path: str,
     bundle_sha256: str,
     markdown_path: str,
+    notify_ready: bool = False,
+    approval_method: Optional[str] = None,
+    approval_reasoning: Optional[str] = None,
+    approval_confidence: Optional[float] = None,
 ) -> Optional[int]:
     """
-    Insert a new recommendation draft record for human approval.
+    Insert a new recommendation draft record for human/AI approval.
     Uses ON CONFLICT to make idempotent (if signal_event_id already exists, skip).
     Returns the draft id if inserted, None if already exists.
     """
@@ -339,11 +344,13 @@ def _insert_recommendation_draft(
                         signal_event_id, event_type, brand, tag, event_time,
                         confidence_snapshot_id, confidence_computed_at, final_confidence, band,
                         bundle_path, bundle_sha256, markdown_path,
-                        notify_ready, created_at
+                        notify_ready, approval_method, approval_reasoning, approval_confidence,
+                        approval_completed_at, created_at
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s,
+                        %s, %s, %s, %s,
                         %s, %s
                     )
                     ON CONFLICT (signal_event_id) DO NOTHING
@@ -352,7 +359,8 @@ def _insert_recommendation_draft(
                     signal_event_id, event_type, brand, tag, event_time,
                     confidence_snapshot_id, confidence_computed_at, final_confidence, band,
                     bundle_path, bundle_sha256, markdown_path,
-                    False,  # notify_ready - requires human approval
+                    notify_ready, approval_method, approval_reasoning, approval_confidence,
+                    datetime.now(timezone.utc) if approval_method else None,
                     datetime.now(timezone.utc)
                 ))
 
@@ -487,7 +495,44 @@ def generate_from_db(event_id: int, evidence_limit: int = DEFAULT_EVIDENCE_LIMIT
         _ensure_append_only(md_path, force=force)
     md_path.write_text(md, encoding="utf-8")
 
-    # Insert recommendation draft for human approval
+    # AI Approval Evaluation
+    print(f"\n{'='*60}")
+    print(f"AI APPROVAL EVALUATION")
+    print(f"{'='*60}")
+
+    try:
+        final_conf = float(snapshot.get("final_confidence")) if snapshot and snapshot.get("final_confidence") is not None else None
+        approval_result = evaluate_recommendation(
+            markdown_path=str(md_path),
+            evidence_path=str(bundle_path),
+            brand=anchor.get("brand") or entity_slug,
+            tag=anchor.get("tag") or "",
+            final_confidence=final_conf,
+            openai_api_key=os.getenv('OPENAI_API_KEY')
+        )
+
+        notify_ready = approval_result['approved']
+        approval_method = approval_result['method']
+        approval_reasoning = approval_result['reasoning']
+        approval_confidence = approval_result['confidence']
+
+        print(f"✓ AI Evaluation Complete")
+        print(f"  Decision: {'APPROVED ✓' if notify_ready else 'REJECTED ✗'}")
+        print(f"  Method: {approval_method}")
+        print(f"  AI Confidence: {approval_confidence:.2f}")
+        print(f"  Reasoning: {approval_reasoning}")
+
+    except Exception as e:
+        print(f"✗ AI approval failed with error: {e}")
+        print(f"  Defaulting to notify_ready=false (manual approval required)")
+        notify_ready = False
+        approval_method = "error"
+        approval_reasoning = f"AI approval error: {str(e)}"
+        approval_confidence = 0.0
+
+    print(f"{'='*60}\n")
+
+    # Insert recommendation draft with AI approval decision
     draft_id: Optional[int] = None
     try:
         draft_id = _insert_recommendation_draft(
@@ -498,11 +543,15 @@ def generate_from_db(event_id: int, evidence_limit: int = DEFAULT_EVIDENCE_LIMIT
             event_time=event_time,
             confidence_snapshot_id=snapshot.get("id") if snapshot else None,
             confidence_computed_at=snapshot.get("computed_at") if snapshot else None,
-            final_confidence=float(snapshot.get("final_confidence")) if snapshot and snapshot.get("final_confidence") is not None else None,
+            final_confidence=final_conf,
             band=snapshot.get("band") if snapshot else None,
             bundle_path=str(bundle_path),
             bundle_sha256=bundle_sha,
             markdown_path=str(md_path),
+            notify_ready=notify_ready,
+            approval_method=approval_method,
+            approval_reasoning=approval_reasoning,
+            approval_confidence=approval_confidence,
         )
     except Exception as e:
         # Log warning but don't fail the artifact generation
@@ -524,6 +573,13 @@ def generate_from_db(event_id: int, evidence_limit: int = DEFAULT_EVIDENCE_LIMIT
         "bundle_sha256": bundle_sha,
         "markdown_path": str(md_path),
         "draft_id": draft_id,
+
+        "ai_approval": {
+            "approved": notify_ready,
+            "confidence": approval_confidence,
+            "reasoning": approval_reasoning,
+            "method": approval_method,
+        },
     }
 
 
