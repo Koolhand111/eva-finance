@@ -1,7 +1,6 @@
 
 
 services:
-  services:
   db:
     image: postgres:16
     container_name: eva_db
@@ -30,7 +29,7 @@ services:
       - eva_net
 
   eva-worker:
-    build: ./eva-worker
+    build: ./eva_worker
     container_name: eva_worker
     restart: unless-stopped
     env_file:

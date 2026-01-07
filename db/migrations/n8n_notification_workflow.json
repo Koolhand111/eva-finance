@@ -1,0 +1,330 @@
+{
+  "name": "EVA Notification Approval Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [240, 300],
+      "id": "schedule-trigger-001",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH claimed AS (\n  SELECT id\n  FROM recommendation_drafts\n  WHERE notify_ready = true\n    AND notified_at IS NULL\n    AND notify_attempts < 5\n  ORDER BY created_at ASC\n  LIMIT 10\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE recommendation_drafts rd\nSET notify_attempts = notify_attempts + 1\nFROM claimed\nWHERE rd.id = claimed.id\nRETURNING\n  rd.id,\n  rd.signal_event_id,\n  rd.brand,\n  rd.tag,\n  rd.event_type,\n  rd.event_time,\n  rd.final_confidence,\n  rd.band,\n  rd.markdown_path,\n  rd.bundle_path,\n  rd.notify_attempts;"
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "id": "pg-claim-drafts-001",
+      "name": "PG: Claim Approved Drafts",
+      "credentials": {
+        "postgres": {
+          "id": "__SET_ME__",
+          "name": "__SET_ME__"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [680, 300],
+      "id": "split-batches-001",
+      "name": "Split In Batches"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "draft-id-freeze",
+              "name": "draft_id",
+              "value": "={{$json.id}}",
+              "type": "number"
+            },
+            {
+              "id": "signal-event-id-freeze",
+              "name": "signal_event_id",
+              "value": "={{$json.signal_event_id}}",
+              "type": "number"
+            },
+            {
+              "id": "brand-freeze",
+              "name": "brand",
+              "value": "={{$json.brand}}",
+              "type": "string"
+            },
+            {
+              "id": "tag-freeze",
+              "name": "tag",
+              "value": "={{$json.tag}}",
+              "type": "string"
+            },
+            {
+              "id": "confidence-freeze",
+              "name": "final_confidence",
+              "value": "={{$json.final_confidence}}",
+              "type": "number"
+            },
+            {
+              "id": "band-freeze",
+              "name": "band",
+              "value": "={{$json.band}}",
+              "type": "string"
+            },
+            {
+              "id": "event-time-freeze",
+              "name": "event_time",
+              "value": "={{$json.event_time}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "keepOnlySet": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [900, 300],
+      "id": "set-freeze-identifiers-001",
+      "name": "Set: Freeze Draft Identifiers"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ntfy:80/eva-finance-recommendations",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"topic\": \"eva-finance-recommendations\",\n  \"title\": \"EVA Signal: {{ $json.brand }}\",\n  \"message\": \"Tag: {{ $json.tag }}\\nConfidence: {{ $json.final_confidence }} ({{ $json.band }})\\nEvent: {{ $json.event_time }}\\n\\nReview recommendation for details.\",\n  \"priority\": \"default\",\n  \"tags\": [\"chart_with_upwards_trend\"],\n  \"click\": \"http://10.10.0.210:3000/dashboard/eva-recommendations?event_id={{ $json.signal_event_id }}\"\n}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1120, 300],
+      "id": "http-notify-ntfy-001",
+      "name": "HTTP: Notify (ntfy)",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "notify-ok-field",
+              "name": "notify_ok",
+              "value": "={{ !!$json.topic && ($json.event ? $json.event === 'message' : true) }}",
+              "type": "boolean"
+            },
+            {
+              "id": "error-message-field",
+              "name": "error_message",
+              "value": "={{ $json.topic ? 'success' : ($json.error?.message || $json.statusMessage || 'unknown error') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "keepOnlySet": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1340, 300],
+      "id": "set-normalize-result-001",
+      "name": "Set: Normalize Notify Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.notify_ok}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 300],
+      "id": "if-notify-succeeded-001",
+      "name": "IF: Notify Succeeded"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE recommendation_drafts\nSET\n  notified_at = NOW(),\n  last_notify_error = NULL\nWHERE id = {{$json.draft_id}}\n  AND notified_at IS NULL\n  AND notify_ready = true;"
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1780, 180],
+      "id": "pg-mark-notified-001",
+      "name": "PG: Mark Notified",
+      "credentials": {
+        "postgres": {
+          "id": "__SET_ME__",
+          "name": "__SET_ME__"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE recommendation_drafts\nSET last_notify_error = '{{ ($json.error_message || \"unknown error\").replace(/'/g, \"''\") }}'\nWHERE id = {{$json.draft_id}};"
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1780, 420],
+      "id": "pg-record-error-001",
+      "name": "PG: Record Error",
+      "credentials": {
+        "postgres": {
+          "id": "__SET_ME__",
+          "name": "__SET_ME__"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "PG: Claim Approved Drafts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: Claim Approved Drafts": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [
+          {
+            "node": "Set: Freeze Draft Identifiers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set: Freeze Draft Identifiers": {
+      "main": [
+        [
+          {
+            "node": "HTTP: Notify (ntfy)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: Notify (ntfy)": {
+      "main": [
+        [
+          {
+            "node": "Set: Normalize Notify Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set: Normalize Notify Result": {
+      "main": [
+        [
+          {
+            "node": "IF: Notify Succeeded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Notify Succeeded": {
+      "main": [
+        [
+          {
+            "node": "PG: Mark Notified",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PG: Record Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: Mark Notified": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "PG: Record Error": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "placeholder"
+  }
+}

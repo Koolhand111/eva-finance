@@ -9,8 +9,8 @@ Detect behavioral trend signals early using conversational data.
 - Confidence is multi-factor, not binary
 
 ## Key Files
-- eva-worker/worker.py — ingestion + extraction
-- eva-worker/scoring.py — signal scoring logic
+- eva_worker/worker.py — ingestion + extraction
+- eva_worker/scoring.py — signal scoring logic
 - db/views/*.sql — signal derivations
 - n8n/workflows — alerting & notifications
 
