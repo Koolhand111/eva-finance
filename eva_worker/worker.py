@@ -1,8 +1,23 @@
 import os
 import time
 import json
+import logging
 import psycopg2
 from openai import OpenAI
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Import notification polling
+try:
+    from eva_worker.notify import poll_and_notify
+except ImportError:
+    logger.warning("Could not import poll_and_notify - notification polling disabled")
+    poll_and_notify = None
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -13,6 +28,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("EVA_MODEL", "gpt-4o-mini")
 PROCESSOR_LLM = f"llm:{MODEL_NAME}:v1"
 PROCESSOR_FALLBACK = "fallback:v1"
+
+# Notification polling interval (seconds)
+NOTIFICATION_POLL_INTERVAL = int(os.getenv("NOTIFICATION_POLL_INTERVAL", "60"))
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -354,13 +372,27 @@ def process_batch(limit: int = 20) -> int:
 
 def main():
     print("EVA worker starting up...")
+    last_notification_poll = 0
+
     while True:
         n = process_batch(limit=20)
         if n:
             print(f"Processed {n} messages")
 
-        # NEW: emit trigger-based signal events
+        # Emit trigger-based signal events
         emit_trigger_events()
+
+        # Notification polling (every NOTIFICATION_POLL_INTERVAL seconds)
+        current_time = time.time()
+        if poll_and_notify and (current_time - last_notification_poll) >= NOTIFICATION_POLL_INTERVAL:
+            try:
+                stats = poll_and_notify()
+                if stats["sent"] > 0 or stats["failed"] > 0:
+                    logger.info(f"[EVA-WORKER] Notifications: {stats['sent']} sent, {stats['failed']} failed")
+            except Exception as e:
+                logger.error(f"[EVA-WORKER] Notification polling error: {e}")
+            finally:
+                last_notification_poll = current_time
 
         time.sleep(10)
 

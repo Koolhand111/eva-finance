@@ -34,6 +34,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      NOTIFICATION_POLL_INTERVAL: 60
+      NTFY_URL: http://eva_ntfy:80
     depends_on:
       - db
     networks:
