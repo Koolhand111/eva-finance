@@ -41,7 +41,9 @@ services:
       - db
     networks:
       - eva_net
-    
+    volumes:
+      - ./scripts:/home/koolhand/projects/eva-finance/scripts:ro
+
   metabase:
     image: metabase/metabase:latest
     container_name: eva_metabase

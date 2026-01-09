@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import logging
+import subprocess
 from typing import Dict, Optional
 import requests
 import psycopg2
@@ -45,6 +46,7 @@ def poll_and_notify() -> Dict[str, int]:
     Returns:
         Dict with 'sent' and 'failed' counts
     """
+    print("[EVA-NOTIFY] poll_and_notify() called", flush=True)
     conn, cursor_cls = _connect_pg()
     stats = {"sent": 0, "failed": 0}
 
@@ -73,8 +75,10 @@ def poll_and_notify() -> Dict[str, int]:
                 pending = cur.fetchall()
 
                 if not pending:
+                    print("[EVA-NOTIFY] No pending notifications", flush=True)
                     return stats
 
+                print(f"[EVA-NOTIFY] Found {len(pending)} pending notifications", flush=True)
                 logger.info(f"[EVA-NOTIFY] Found {len(pending)} pending notifications")
 
                 # Process each notification
@@ -118,12 +122,38 @@ def poll_and_notify() -> Dict[str, int]:
                             WHERE id = %s
                         """, (draft_id,))
 
+                        print(f"[EVA-NOTIFY] ✓ Sent notification for draft_id={draft_id} ({brand}/{tag})", flush=True)
                         logger.info(f"[EVA-NOTIFY] ✓ Sent notification for draft_id={draft_id} ({brand}/{tag})")
                         stats["sent"] += 1
+
+                        # Trigger paper trade entry for approved signal
+                        try:
+                            logger.info(f"[PAPER-TRADE] Triggering paper trade entry for {brand}/{tag}")
+                            result = subprocess.run(
+                                ['python3', '/home/koolhand/projects/eva-finance/scripts/paper_trading/paper_trade_entry.py'],
+                                capture_output=True,
+                                text=True,
+                                timeout=30
+                            )
+
+                            if result.returncode == 0:
+                                logger.info(f"[PAPER-TRADE] ✓ Paper trade entry successful: {result.stdout.strip()}")
+                                print(f"[PAPER-TRADE] ✓ Created paper trade for {brand}/{tag}", flush=True)
+                            else:
+                                logger.warning(f"[PAPER-TRADE] ✗ Paper trade entry failed: {result.stderr.strip()}")
+                                print(f"[PAPER-TRADE] ✗ Failed to create paper trade: {result.stderr.strip()}", flush=True)
+
+                        except subprocess.TimeoutExpired:
+                            logger.error("[PAPER-TRADE] Paper trade entry timed out after 30 seconds")
+                            print("[PAPER-TRADE] ✗ Timeout after 30 seconds", flush=True)
+                        except Exception as e:
+                            logger.error(f"[PAPER-TRADE] Paper trade entry error: {e}")
+                            print(f"[PAPER-TRADE] ✗ Error: {e}", flush=True)
 
                     except Exception as e:
                         # Record failure
                         error_msg = str(e)[:500]  # Truncate to avoid oversized errors
+                        print(f"[EVA-NOTIFY] ✗ Failed to notify draft_id={draft_id}: {e}", flush=True)
                         logger.error(f"[EVA-NOTIFY] ✗ Failed to notify draft_id={draft_id}: {e}")
 
                         cur.execute("""
@@ -141,6 +171,7 @@ def poll_and_notify() -> Dict[str, int]:
         return stats
 
     except Exception as e:
+        print(f"[EVA-NOTIFY] Poll/notify failed: {e}", flush=True)
         logger.error(f"[EVA-NOTIFY] Poll/notify failed: {e}")
         return stats
     finally:

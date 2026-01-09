@@ -11,3 +11,7 @@ __pycache__/
 .vscode/
 .ipynb_checkpoints/
 *.bak.*
+
+# Backtest output files
+backtest_*.json
+backtest_*.csv
