@@ -1,5 +1,6 @@
 {
-  "name": "EVA Reddit Ingestion - Posts Only",
+  "name": "EVA Reddit Ingestion - Posts Only [DEPRECATED - Use eva_ingest/reddit_posts.py]",
+  "notes": "DEPRECATED: This n8n workflow has been replaced by a deterministic Python ingestion job at eva_ingest/reddit_posts.py. See docs/ingestion_reddit_posts.md for migration instructions.",
   "nodes": [
     {
       "parameters": {

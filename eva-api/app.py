@@ -49,6 +49,7 @@ def intake_message(msg: IntakeMessage):
             """
             INSERT INTO raw_messages (source, platform_id, timestamp, text, url, meta)
             VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source, platform_id) DO NOTHING
             RETURNING id;
             """,
             (
@@ -60,14 +61,20 @@ def intake_message(msg: IntakeMessage):
                 Json(msg.meta)
             )
         )
-        new_id = cur.fetchone()[0]
+        result = cur.fetchone()
         conn.commit()
         cur.close()
         conn.close()
+
+        if result is None:
+            # Duplicate detected, insertion was skipped
+            return {"status": "received", "duplicate": True}
+
+        new_id = result[0]
+        return {"status": "ok", "id": new_id}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    return {"status": "ok", "id": new_id}
 
 
 # ------------------------------------

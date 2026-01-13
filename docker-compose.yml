@@ -27,6 +27,12 @@ services:
       - "9080:8080"
     networks:
       - eva_net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   eva-worker:
     build: ./eva_worker
@@ -74,6 +80,38 @@ services:
 
   # Note: n8n is running externally and connected to eva_net
   # Access at http://localhost:5678
+
+  eva-ingest-reddit:
+    image: eva-finance-eva-worker   # reuse the worker image so python env is already there
+    depends_on:
+      - eva-api
+    networks:
+      - eva_net
+    restart: unless-stopped
+
+
+    working_dir: /app
+
+
+    environment:
+      - EVA_API_URL=http://eva-api:8080/intake/message
+      - SUBREDDITS=BuyItForLife,Frugal,running,malefashionadvice,femalefashionadvice,goodyearwelt,onebag,sneakers
+      - LIMIT=25
+      - PYTHONPATH:=/app
+
+    volumes:
+      - type: bind
+        source: /home/koolhand/projects/eva-finance
+        target: /app
+        read_only: true  
+
+    command: >
+      sh -lc 'while true; do
+        python3 -m eva_ingest.reddit_posts --subreddits "$$SUBREDDITS" --limit "$$LIMIT";
+        date -Iseconds; echo "ingest: sleep 900";
+        sleep 900;
+      done'
+
 
 
 volumes:
