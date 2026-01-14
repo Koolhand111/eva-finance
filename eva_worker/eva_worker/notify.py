@@ -21,7 +21,7 @@ DB_HOST = os.getenv("POSTGRES_HOST", "localhost")
 DB_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 DB_NAME = os.getenv("POSTGRES_DB", "eva_finance")
 DB_USER = os.getenv("POSTGRES_USER", "eva")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "eva_password_change_me")
+DB_PASSWORD = os.environ["POSTGRES_PASSWORD"]  # Required - no default
 NTFY_URL = os.getenv("NTFY_URL", "http://eva_ntfy:80")
 
 MAX_RETRY_ATTEMPTS = 3
@@ -130,7 +130,9 @@ def poll_and_notify() -> Dict[str, int]:
                         try:
                             logger.info(f"[PAPER-TRADE] Triggering paper trade entry for {brand}/{tag}")
                             result = subprocess.run(
-                                ['python3', '/home/koolhand/projects/eva-finance/scripts/paper_trading/paper_trade_entry.py'],
+                                import os
+                                script_path = os.path.join(os.environ.get('PROJECT_ROOT', '/app'), 'scripts/paper_trading/paper_trade_entry.py')
+                                ['python3', script_path],
                                 capture_output=True,
                                 text=True,
                                 timeout=30
