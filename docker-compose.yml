@@ -48,7 +48,7 @@ services:
     networks:
       - eva_net
     volumes:
-      - ./scripts:/home/koolhand/projects/eva-finance/scripts:ro
+      - ./scripts:/app/scripts:ro
 
   metabase:
     image: metabase/metabase:latest
@@ -102,7 +102,7 @@ services:
 
     volumes:
       - type: bind
-        source: /home/koolhand/projects/eva-finance
+        source: .
         target: /app
         read_only: true  
 
