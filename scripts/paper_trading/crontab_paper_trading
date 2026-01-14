@@ -1,0 +1,15 @@
+# EVA Finance - Paper Trading Cron Jobs
+#
+# Daily updater runs at 4:30 PM ET (market close + 30 min)
+# This ensures we get end-of-day prices and check exit conditions
+#
+# 4:30 PM ET = 21:30 UTC (during standard time) or 20:30 UTC (during daylight time)
+# Using 21:30 UTC to be safe - adjust if needed
+#
+# Format: minute hour day month weekday command
+
+# Daily position updater - 4:30 PM ET (21:30 UTC)
+30 21 * * 1-5 cd /home/koolhand/projects/eva-finance && docker exec eva_worker python /home/koolhand/projects/eva-finance/scripts/paper_trading/paper_trade_updater.py >> /home/koolhand/projects/eva-finance/logs/paper_trading_updater.log 2>&1
+
+# Weekly paper trade entry check - Run Saturdays at 10am ET to catch any RECOMMENDATION_ELIGIBLE signals from the week
+0 15 * * 6 cd /home/koolhand/projects/eva-finance && docker exec eva_worker python /home/koolhand/projects/eva-finance/scripts/paper_trading/paper_trade_entry.py >> /home/koolhand/projects/eva-finance/logs/paper_trading_entry.log 2>&1

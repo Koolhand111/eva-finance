@@ -384,7 +384,9 @@ def main():
 
         # Notification polling (every NOTIFICATION_POLL_INTERVAL seconds)
         current_time = time.time()
+        print(f"[DEBUG] Checking notification poll: poll_and_notify={bool(poll_and_notify)}, elapsed={current_time - last_notification_poll:.1f}s, interval={NOTIFICATION_POLL_INTERVAL}s", flush=True)
         if poll_and_notify and (current_time - last_notification_poll) >= NOTIFICATION_POLL_INTERVAL:
+            print("[DEBUG] Entering notification poll...", flush=True)
             try:
                 stats = poll_and_notify()
                 if stats["sent"] > 0 or stats["failed"] > 0:

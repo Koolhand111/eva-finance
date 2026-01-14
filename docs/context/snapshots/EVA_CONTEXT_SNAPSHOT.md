@@ -2,177 +2,247 @@
 
 PROJECT PURPOSE
 
-EVA-Finance detects early behavioral trend signals by analyzing conversational data from social platforms. It extracts brand mentions, behavioral tags (comfort, brand-switch), and sentiment/intent using LLM-powered extraction. Confidence scoring identifies high-signal brand-tag pairs for tracking. In-scope: ingest, extraction, scoring, signal detection, notification drafts. Out-of-scope: automated trading, product recommendations, ticker forecasting, production-scale ingestion infrastructure.
+EVA-Finance detects consumer behavioral trends from Reddit discussions and validates them as investment signals through paper trading. The system ingests Reddit data via n8n workflows, extracts brand mentions and behavioral tags using LLM processing, scores signals through confidence modeling, generates AI-approved recommendations, and automatically creates paper trading positions to validate forward-looking performance. In scope: Reddit ingestion, LLM extraction, confidence scoring, AI approval, notification pipeline, paper trading validation. Out of scope: Real capital deployment, multi-source fusion (Twitter/Discord), e-commerce velocity tracking, historical backtesting (Reddit API access denied).
 
 MENTAL MODEL / EXECUTION ASSUMPTIONS
 
-- Tags represent behaviors (comfort, brand-switch, running), not products
-- Brand flow models switching pressure (multi-brand signals more valuable than single-brand)
-- Confidence is multi-factor (acceleration, intent, spread, baseline, suppression), not binary
-- LLM extraction first, heuristic fallback second (never block pipeline)
-- Prefer false negatives over false positives (strict gates: intent ≥0.65, suppression ≥0.50, spread ≥0.50)
-- Persistence > spike magnitude (1-day wonders get penalized)
-- Evidence bundles are append-only (no rewrites, SHA256-verified)
-- Notification requires human approval (recommendation_drafts.notify_ready gate)
-- Docker-first local environment (postgres, eva-api, eva-worker, metabase, ntfy)
+- PostgreSQL runs in Docker container at 172.20.0.2:5432 (not localhost)
+- All database connections from host scripts must use 172.20.0.2
+- eva-worker container has volume mount to /home/koolhand/projects/eva-finance/scripts:ro for paper trading access
+- Paper trading uses simulated $1000 positions per signal, no real capital
+- Exit rules: 90 days (time), +15% (profit target), -10% (stop loss)
+- Validation criteria: Win rate ≥50%, Avg return ≥5%, ≥10 closed trades
+- Many brands map to private companies (BRAND_TO_TICKER returns None) - these are skipped
+- Signal events use UNIQUE index on (event_type, tag, brand, day) to prevent duplicates
+- Notification pipeline triggers paper trade entry via subprocess after AI approval
+- Cron jobs run on host machine (not in containers) at 4:00 PM and 4:05 PM ET weekdays
+- yfinance returns float, PostgreSQL returns Decimal - explicit type conversion required
+- ROADMAP.md defines 12-week Phase 0 validation roadmap (Week 1-12 structure)
 
 CURRENT ARCHITECTURE
 
-Ingest sources:
-- Manual insertion via eva-api POST /intake/message
-- Future: n8n workflows (Reddit, Twitter, etc.)
+**Ingest sources:**
+- n8n workflow polls Reddit subreddits (BuyItForLife, Frugal, running, sneakers, malefashionadvice, femalefashionadvice, goodyearwelt, onebag)
+- Posts inserted into raw_messages table (981 messages currently)
 
-Processing pipeline:
-- raw_messages → worker.py process_batch() → brain_extract() (LLM/fallback) → processed_messages
-- worker.py emit_trigger_events() → signal_events (TAG_ELEVATED, BRAND_DIVERGENCE)
-- eva_confidence_v1.py → eva_confidence_v1 table (daily scoring) → signal_events (RECOMMENDATION_ELIGIBLE, WATCHLIST_WARM)
-- eva_worker/eva_worker/generate.py → recommendation_drafts + artifacts (.json.gz bundle, .md recommendation)
+**Processing pipeline:**
+- eva-worker processes raw_messages → LLM extracts brands/tags → processed_messages
+- eva_confidence_v1.py runs daily (1:05 AM cron) → computes confidence scores → behavior_states, brand_mentions tables
+- worker.py emit_trigger_events() → creates signal_events from v_trigger_tag_elevated and v_trigger_brand_divergence
+- reco_runner.py generates markdown recommendations for RECOMMENDATION_ELIGIBLE signals → recommendation_drafts table
+- ai_approval.py evaluates recommendations using gpt-4o-mini → sets notify_ready flag
+- notify.py polls recommendation_drafts for notify_ready=true → sends ntfy notifications → triggers paper_trade_entry.py
 
-Workers / schedulers:
-- eva-worker container: runs worker.py (10s poll loop, LLM extraction + trigger emission)
-- Manual: python eva_confidence_v1.py (scores daily candidates, emits RECOMMENDATION_ELIGIBLE if band=HIGH)
-- Manual: python -m eva_worker.eva_worker.generate --event-id <id> (generates recommendation artifacts)
+**Workers / schedulers:**
+- eva-worker container: Runs worker.py with notification polling (60s interval)
+- Cron (host): eva_confidence_v1.py daily at 1:05 AM
+- Cron (host): update_paper_prices.py weekdays 4:00 PM (market close)
+- Cron (host): check_paper_exits.py weekdays 4:05 PM
 
-Persistence layer (key tables):
-- raw_messages: platform posts/comments (processed flag)
-- processed_messages: extracted brand[], tags[], sentiment, intent
-- signal_events: trigger/scoring events (TAG_ELEVATED, BRAND_DIVERGENCE, RECOMMENDATION_ELIGIBLE, WATCHLIST_WARM)
-- behavior_states: tag-level state tracking (NORMAL, ELEVATED)
-- eva_confidence_v1: daily brand+tag confidence scores (acceleration, intent, spread, baseline, suppression → final_confidence, band)
-- recommendation_drafts: human-approval gate for notifications (notify_ready, approved_at, notify_attempts, last_notify_error)
+**Persistence layer (key tables):**
+- raw_messages: Reddit data from n8n (981 rows)
+- processed_messages: LLM-extracted brands/tags (981 rows)
+- signal_events: Trigger events (2603 rows, includes TAG_ELEVATED, BRAND_DIVERGENCE, RECOMMENDATION_ELIGIBLE)
+- recommendation_drafts: AI-approved recommendations (5 rows)
+- paper_trades: Simulated positions (0 rows - no trades created yet)
+- behavior_states: Tag confidence scores
+- brand_mentions: Brand frequency tracking
 
-Output artifacts:
-- eva_worker/output/recommendations/<brand_slug>/<event_id>_evidence.json.gz (canonical evidence bundle)
-- eva_worker/output/recommendations/<brand_slug>/<event_id>_EVA-Finance_Recommendation.md (human-readable report)
+**Output artifacts:**
+- Markdown recommendation reports (generated by reco_runner.py)
+- Gzipped evidence bundles (evidence.json.gz)
+- ntfy notifications (http://localhost:8085)
+- Paper trading logs (/home/koolhand/logs/eva/paper_*.log)
 
 WHAT IS WORKING (END-TO-END)
 
-- Docker compose up: postgres, eva-api, eva-worker, metabase, ntfy
-- Manual message insert via curl → eva-api → raw_messages
-- worker.py automatic extraction (LLM + heuristic fallback) → processed_messages
-- worker.py trigger emission (TAG_ELEVATED, BRAND_DIVERGENCE) → signal_events
-- Manual eva_confidence_v1.py scoring → eva_confidence_v1 table + RECOMMENDATION_ELIGIBLE events
-- Manual generate.py --event-id <id> → evidence bundle + markdown recommendation + recommendation_drafts record
-- Automatic recommendation_drafts insertion after artifact creation (idempotent via ON CONFLICT)
-- AI approval agent evaluates recommendations and sets notify_ready flag automatically
-- LLM-based quality assessment with reasoning (falls back to rule-based if API unavailable)
-- DB schema migrations (init.sql, 002_add_notification_approval.sql, 003_add_ai_approval_fields.sql)
+- n8n Reddit ingestion → raw_messages (981 messages collected Jan 1-8, 2026)
+- LLM processing → brand/tag extraction → processed_messages (100% completion)
+- Confidence scoring → behavior_states → signal_events generation (2603 events)
+- Recommendation generation for RECOMMENDATION_ELIGIBLE signals (5 drafts created)
+- AI approval evaluation using gpt-4o-mini (approve/reject decisions with reasoning)
+- Notification pipeline → ntfy alerts when notify_ready=true
+- Paper trading entry triggered automatically after notifications (subprocess integration)
+- Cron automation for daily price updates and exit checks (scheduled, not yet tested with live positions)
+- Database migrations applied successfully (002-005)
+- Docker Compose stack running (eva_db, eva_worker, eva_ntfy, eva-api, metabase)
+- Git version control with recent commits pushed to GitHub
 
 WHAT IS PARTIALLY WORKING
 
-- n8n workflows exist (eva_worker/n8n.json) but not deployed/tested
-- n8n notification polling queries (db/migrations/n8n_notification_queries.sql) defined but not integrated
-- ntfy container running but no automated notifications wired up
-- Retry logic for failed notifications (notify_attempts, last_notify_error) defined but not tested
+- Paper trading system deployed but 0 positions created (all test signals were private companies like Patagonia, Carhartt)
+- Brand-to-ticker mapping incomplete - many consumer brands return None (New Balance, Patagonia, Carhartt, North Face conglomerate issues)
+- Cron jobs configured but untested with actual open positions (need public company signals to validate)
+- Metabase dashboard exists but not configured with paper trading views
+- Historical backtest script exists (scripts/backtest/historical_backtest.py) but found 0 trends (only 8 days of data, needs 365 days)
+- PRAW backfill script created (reddit_praw_backfill.py) but waiting for Reddit API credentials
 
 KNOWN ISSUES / BUGS
 
-- eva_confidence_v1.py hardcoded to score only current_date candidates (misses multi-day accumulation)
-- n8n notification polling not yet integrated with recommendation_drafts table
+- BRAND_TO_TICKER mapping has gaps for private companies - need expanded public company coverage (20 brands → 30+ brands target)
+- Type mismatch errors fixed (PostgreSQL Decimal vs yfinance float) but requires explicit float() conversion everywhere
+- yf.download() deprecated show_errors parameter removed (fixed in update_paper_prices.py)
+- worker.py shows deleted eva_worker/notify.py in git status (file moved to eva_worker/eva_worker/notify.py, stale reference)
+- No validation with actual open positions yet - paper trading untested end-to-end with market data
+- Reddit API access denied - cannot perform historical backtest validation with real 365-day data
+- Some signals may not be materially significant (e.g., North Face = <20% of VFC revenue) - materiality scoring not implemented
 
 CURRENT FOCAL PROBLEM
 
-AI approval agent complete. generate.py now automatically evaluates recommendations using LLM (or rule-based fallback) and sets notify_ready flag based on quality assessment. Approval reasoning and confidence stored in database for audit trail. Next focus: integrate n8n notification polling workflow to query recommendation_drafts.notify_ready=true and send notifications via ntfy.
+System is fully operational but generating zero paper trading positions because detected brands are predominantly private companies. Need to either: (1) expand BRAND_TO_TICKER mapping to include more publicly-traded consumer brands, (2) wait for signals from existing public brands (Hoka/DECK, On Running/ONON, Lululemon/LULU, Crocs/CROX, etc.), or (3) tune signal detection to favor public companies. This blocks validation of paper trading system with real market data. Without open positions, cannot verify cron automation, price updates, exit checks, or 12-week validation roadmap progress.
 
 RECENT CHANGES
 
-Last commit (a16a5a6): Auto-insert recommendation_drafts after artifact generation
-- Added _insert_recommendation_draft() function to generate.py
-- Auto-insertion into recommendation_drafts table after creating artifacts
-- Idempotency via ON CONFLICT (signal_event_id)
-- Returns draft_id in generate_from_db() response
+**Last 2 commits (pushed to GitHub):**
+- 187adac: Add ROADMAP.md for Phase 0 validation planning (12-week roadmap, validation criteria, weekly milestones)
+- 61c874a: Add paper trading system for forward-looking validation (005_paper_trading_system.sql migration, paper_trade_entry.py, update_paper_prices.py, check_paper_exits.py, docker-compose.yml volume mount, yfinance dependency, notify.py subprocess integration)
 
-Current uncommitted work:
-- Added db/migrations/003_add_ai_approval_fields.sql (approval_method, approval_reasoning, approval_confidence, approval_completed_at)
-- Created eva_worker/eva_worker/ai_approval.py (LLM-based quality evaluation)
-- Modified generate.py: integrated AI approval before draft insertion
-- AI evaluates recommendations, sets notify_ready flag automatically
-- Falls back to rule-based approval if OpenAI API unavailable
-- Tested end-to-end: AI approval evaluation runs, database fields populated
-- Container rebuilt and restarted with AI approval code
+**Uncommitted changes:**
+- eva_worker/worker.py: Debug logging additions (print statements for notification poll debugging)
+- eva_worker/notify.py: Deleted file reference (moved to eva_worker/eva_worker/notify.py)
+- db/migrations/004_add_unique_constraint_for_backfill.sql: Untracked migration file
+
+**Operational changes:**
+- Cron jobs added for daily paper trading automation (4:00 PM and 4:05 PM weekdays)
+- Docker volume mount added to eva-worker container for scripts access
+- yfinance added to eva_worker/requirements.txt and container rebuilt
 
 NEXT STEPS (ORDERED)
 
-1. ✅ COMPLETE: Commit package structure changes (commit 0829675)
-2. ✅ COMPLETE: Verify container works after restructure (container running, Python 3.12.12, dependencies OK)
-3. ✅ COMPLETE: Wire generate.py output to auto-insert recommendation_drafts row after artifact creation (commit a16a5a6)
-4. ✅ COMPLETE: Implement AI approval agent for automatic quality evaluation
-5. Test n8n workflow import (eva_worker/n8n.json) and notification polling queries
-6. Integrate n8n notification polling with recommendation_drafts table
-7. Test ntfy notification delivery end-to-end
-8. Consider migrating legacy worker.py/scoring.py/eva_confidence_v1.py into eva_worker/eva_worker/ package (optional cleanup)
+1. Expand BRAND_TO_TICKER mapping in scripts/paper_trading/paper_trade_entry.py with 10+ additional publicly-traded consumer brands (athletic, outdoor, fashion categories)
+2. Configure Metabase dashboard with v_paper_trading_performance, v_open_positions, v_closed_positions views for real-time monitoring (Week 1 ROADMAP.md task)
+3. Wait for signal detection on public company brands or manually test paper_trade_entry.py with synthetic signal_event_id to validate end-to-end flow
+4. Verify cron automation works correctly when first position opens (check logs at /home/koolhand/logs/eva/paper_*.log)
+5. Implement brand materiality scoring (Week 4 ROADMAP.md task) to weight high-materiality brands (>20% parent revenue) higher in confidence scoring
+6. Set up Google Trends integration (Week 1 ROADMAP.md task) for cross-validation of social signals with search interest
 
 INVARIANTS / RULES
 
-- Evidence bundles (.json.gz) are append-only (no overwrites unless --force in dev)
-- recommendation_drafts.notified_at cannot be set unless notify_ready = true (DB constraint chk_notify_requires_approval)
-- Confidence gates must remain strict (intent ≥0.65, suppression ≥0.50, spread ≥0.50) to avoid noise
-- Never skip LLM fallback (fallback_brain_extract must always succeed)
-- Tags must be behavior-first (comfort, brand-switch, running), not product names
-- Multi-brand signals (len(brand) ≥2) + switch/comparative language → enforce brand-switch tag + intent=own
+- Paper trades table has UNIQUE constraint on signal_event_id (one paper trade per signal)
+- signal_events table has UNIQUE index on (event_type, tag, brand, day) to prevent duplicate triggers
+- Exit rules immutable for Phase 0: 90 days OR +15% OR -10% (do not change without invalidating comparison)
+- Position size fixed at $1000 per trade for consistency
+- Database connections from host must use 172.20.0.2 (Docker container IP), never localhost
+- Cron jobs run on host machine, not inside containers (scripts must access database via 172.20.0.2)
+- Volume mount is read-only (:ro) - scripts cannot write to container filesystem
+- Paper trading logs written to /home/koolhand/logs/eva/ (not /var/log/eva - permission issues)
+- Do not modify docs/context/snapshots/EVA_CONTEXT_SNAPSHOT_PROMPT.md (this file is the prompt, not the output)
+- Validation criteria for Phase 1 GO decision: Win rate ≥50%, Avg return ≥5%, ≥10 closed trades (Week 12 ROADMAP.md)
 
 KEY FILE LOCATIONS
 
-- db/init.sql (schema: tables, views, indexes, functions)
-- db/migrations/002_add_notification_approval.sql (recommendation_drafts table, approval gates)
-- eva_worker/worker.py (root, stale but currently running in container)
-- eva_worker/eva_confidence_v1.py (root, stale but manual scoring still uses it)
-- eva_worker/eva_worker/generate.py (new package, artifact generation)
-- eva_worker/eva_worker/render.py (markdown template rendering)
-- eva_worker/eva_worker/sanitize.py (PII/URL sanitization)
-- eva_worker/eva_worker/hashutil.py (SHA256 utilities)
-- eva-api/app.py (FastAPI: /intake/message, /events, /events/<id>/ack)
-- docker-compose.yml (service definitions: db, eva-api, eva-worker, metabase, ntfy)
-- Project_Map.md (design decisions, key concepts)
+**Paper trading system:**
+- scripts/paper_trading/paper_trade_entry.py (creates positions, BRAND_TO_TICKER mapping)
+- scripts/paper_trading/update_paper_prices.py (daily price updater, yfinance integration)
+- scripts/paper_trading/check_paper_exits.py (exit rule checker)
+- db/migrations/005_paper_trading_system.sql (schema, views, triggers)
+
+**Worker and notification pipeline:**
+- eva_worker/worker.py (main worker loop, emit_trigger_events, notification polling)
+- eva_worker/eva_worker/notify.py (notification polling, paper trade subprocess trigger)
+- eva_worker/eva_worker/ai_approval.py (LLM-based recommendation evaluation)
+- eva_worker/eva_worker/reco_runner.py (markdown recommendation generation)
+- eva_worker/eva_worker/generate.py (LLM extraction logic)
+
+**Configuration:**
+- docker-compose.yml (service definitions, volume mounts, environment variables)
+- eva_worker/requirements.txt (Python dependencies including yfinance)
+- .env (credentials, API keys, database config)
+
+**Documentation:**
+- ROADMAP.md (12-week Phase 0 validation roadmap)
+- docs/context/snapshots/EVA_CONTEXT_SNAPSHOT.md (this file)
+- docs/context/snapshots/EVA_CONTEXT_SNAPSHOT_PROMPT.md (generation prompt - do not modify)
+
+**Backtest and data collection:**
+- scripts/backtest/historical_backtest.py (backtest validation script)
+- scripts/backtest/reddit_praw_backfill.py (PRAW-based historical data collection - waiting for credentials)
 
 QUICK START (RESTORE CONTEXT)
 
-Verify system health:
+**Verify system health:**
 ```bash
-docker compose ps
-curl http://localhost:9080/health
-psql postgres://eva:eva_password_change_me@localhost:5432/eva_finance -c "SELECT COUNT(*) FROM raw_messages;"
+cd /home/koolhand/projects/eva-finance
+docker ps  # Verify eva_db, eva_worker, eva_ntfy, eva-api running
+docker logs eva_worker --tail 50  # Check worker activity
+crontab -l | grep paper  # Verify cron jobs configured
 ```
 
-Run critical manual steps:
+**Inspect current state:**
 ```bash
-# Ingest test message
-curl -X POST http://localhost:9080/intake/message -H "Content-Type: application/json" -d '{"source":"reddit","timestamp":"2025-01-06T12:00:00Z","text":"Switched from Nike to Hoka for running. Way more comfortable."}'
+# Check data pipeline
+docker exec eva_db psql -U eva -d eva_finance -c "
+SELECT COUNT(*) as count, 'raw_messages' as table FROM raw_messages
+UNION ALL SELECT COUNT(*), 'processed_messages' FROM processed_messages
+UNION ALL SELECT COUNT(*), 'signal_events' FROM signal_events
+UNION ALL SELECT COUNT(*), 'recommendation_drafts' FROM recommendation_drafts
+UNION ALL SELECT COUNT(*), 'paper_trades' FROM paper_trades;
+"
 
-# Wait 10s for worker to process, then score
-docker exec -it eva_worker python eva_confidence_v1.py
+# Check paper trading performance
+docker exec eva_db psql -U eva -d eva_finance -c "SELECT * FROM v_paper_trading_performance;"
 
-# Check signal events
-psql postgres://eva:eva_password_change_me@localhost:5432/eva_finance -c "SELECT * FROM signal_events ORDER BY id DESC LIMIT 5;"
+# Check open positions
+docker exec eva_db psql -U eva -d eva_finance -c "SELECT * FROM v_open_positions;"
 
-# Generate recommendation for event_id (if RECOMMENDATION_ELIGIBLE exists)
-docker exec -it eva_worker python -m eva_worker.eva_worker.generate --event-id <event_id>
+# Check recent signals
+docker exec eva_db psql -U eva -d eva_finance -c "
+SELECT id, event_type, brand, tag, day, severity
+FROM signal_events
+ORDER BY created_at DESC
+LIMIT 10;
+"
 ```
 
-Inspect current state:
+**Run critical manual steps (if needed):**
 ```bash
-docker compose logs eva_worker --tail 50
-psql postgres://eva:eva_password_change_me@localhost:5432/eva_finance -c "SELECT COUNT(*) FROM processed_messages WHERE processor_version LIKE 'llm:%';"
-ls -lh eva_worker/output/recommendations/
+# Test paper trade entry manually
+cd /home/koolhand/projects/eva-finance/scripts/paper_trading
+python3 paper_trade_entry.py
+
+# Test price updater (will fail if no open positions)
+python3 update_paper_prices.py
+
+# Test exit checker
+python3 check_paper_exits.py
+
+# Check paper trading logs
+tail -f /home/koolhand/logs/eva/paper_prices.log
+tail -f /home/koolhand/logs/eva/paper_exits.log
+```
+
+**Git status:**
+```bash
+git status  # Check uncommitted changes
+git log --oneline -5  # Recent commits
 ```
 
 ENVIRONMENT
 
-- OS: Linux (kernel 6.8.0-90-generic)
-- Runtime: Python 3.12, postgres:16, Docker Compose
-- Services:
-  - db (postgres:16): internal 5432
-  - eva-api (FastAPI): 0.0.0.0:9080
-  - eva-worker (Python): no exposed ports
-  - metabase: 0.0.0.0:3000
-  - ntfy: 0.0.0.0:8085
-- Ports: 9080 (API), 3000 (Metabase), 8085 (ntfy)
-- External dependencies: OpenAI API (gpt-4o-mini for LLM extraction, optional)
+- **OS:** Linux (Ubuntu-based, kernel 6.8.0-90-generic)
+- **Runtime versions:**
+  - Python: 3.12 (eva_worker container and host)
+  - PostgreSQL: 16 (Docker container)
+  - Docker Compose: v2.x
+- **Services:**
+  - eva_db (postgres:16) - port 5432 internal, IP 172.20.0.2
+  - eva_worker (Python worker) - runs worker.py with notification polling
+  - eva_ntfy (ntfy server) - port 8085 exposed
+  - eva-api (FastAPI) - port 9080 exposed
+  - eva_metabase (Metabase) - port 3000 exposed
+- **External dependencies:**
+  - OpenAI API (gpt-4o-mini for LLM extraction and AI approval)
+  - yfinance (Yahoo Finance API for stock prices)
+  - n8n (Reddit workflow ingestion) - http://10.10.0.210:5678/
+- **Cron schedule:**
+  - 1:05 AM daily: eva_confidence_v1.py (confidence scoring)
+  - 4:00 PM Mon-Fri: update_paper_prices.py (price updates)
+  - 4:05 PM Mon-Fri: check_paper_exits.py (exit rule checks)
 
 STATUS
 
-Docker services running. DB schema complete. Package structure committed (dual structure: legacy root + new package). Container verified working (Python 3.12.12, dependencies OK). Worker extracting and emitting triggers. Scoring and recommendation generation manual. Notification pipeline defined but not wired. Next: auto-insert recommendation_drafts after generation.
+Phase 0 validation system fully operational but blocked on generating paper trading positions from public company signals (0 positions created, need brand coverage expansion or public brand signals).
 
 LAST UPDATED
 
-2026-01-07 (post-commit 0829675, container verified)
+2026-01-09

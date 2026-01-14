@@ -1,7 +1,18 @@
 import os
 import json
+import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+# Google Trends cross-validation
+try:
+    from eva_worker.google_trends import GoogleTrendsValidator
+    TRENDS_AVAILABLE = True
+except ImportError:
+    TRENDS_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -59,13 +70,19 @@ def baseline_score_from_msg_count(msg_count: int) -> float:
 
 
 def eva_v1_final(accel, intent, spread, baseline, suppression) -> dict:
+    # Adaptive thresholds for Phase 0 (early-stage data)
+    # Production thresholds will be raised after 30+ days and 20+ subreddits
+    INTENT_THRESHOLD = float(os.getenv("EVA_GATE_INTENT", "0.50"))  # Lowered from 0.65
+    SUPPRESSION_THRESHOLD = float(os.getenv("EVA_GATE_SUPPRESSION", "0.40"))  # Lowered from 0.50
+    SPREAD_THRESHOLD = float(os.getenv("EVA_GATE_SPREAD", "0.25"))  # Lowered from 0.50 for early data
+
     # Hard gates (discipline)
-    if intent < 0.65:
-        return {"band": "SUPPRESSED", "reason": "GATE_INTENT_LT_0.65", "final": 0.0}
-    if suppression < 0.50:
-        return {"band": "SUPPRESSED", "reason": "GATE_SUPPRESSION_LT_0.50", "final": 0.0}
-    if spread < 0.50:
-        return {"band": "SUPPRESSED", "reason": "GATE_SPREAD_LT_0.50", "final": 0.0}
+    if intent < INTENT_THRESHOLD:
+        return {"band": "SUPPRESSED", "reason": f"GATE_INTENT_LT_{INTENT_THRESHOLD}", "final": 0.0}
+    if suppression < SUPPRESSION_THRESHOLD:
+        return {"band": "SUPPRESSED", "reason": f"GATE_SUPPRESSION_LT_{SUPPRESSION_THRESHOLD}", "final": 0.0}
+    if spread < SPREAD_THRESHOLD:
+        return {"band": "SUPPRESSED", "reason": f"GATE_SPREAD_LT_{SPREAD_THRESHOLD}", "final": 0.0}
 
     final = (
         intent * 0.30 +
@@ -75,7 +92,11 @@ def eva_v1_final(accel, intent, spread, baseline, suppression) -> dict:
         suppression * 0.15
     )
 
-    band = "HIGH" if final >= 0.80 else ("WATCHLIST" if final >= 0.65 else "SUPPRESSED")
+    # Adaptive band thresholds for Phase 0
+    HIGH_THRESHOLD = float(os.getenv("EVA_BAND_HIGH", "0.60"))  # Lowered from 0.80
+    WATCHLIST_THRESHOLD = float(os.getenv("EVA_BAND_WATCHLIST", "0.50"))  # Lowered from 0.65
+
+    band = "HIGH" if final >= HIGH_THRESHOLD else ("WATCHLIST" if final >= WATCHLIST_THRESHOLD else "SUPPRESSED")
     return {"band": band, "reason": None, "final": float(round(final, 4))}
 
 
@@ -86,11 +107,11 @@ def main():
     conn.autocommit = True
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # Score "today" candidates (matches your view output day=current_date)
+        # Score recent candidates (Phase 0: include last 7 days for validation)
         cur.execute("""
             SELECT *
             FROM public.v_eva_candidate_brand_signals_v1
-            WHERE day = current_date
+            WHERE day >= current_date - INTERVAL '7 days'
         """)
         rows = cur.fetchall()
 
@@ -130,6 +151,81 @@ def main():
             band = result["band"]
             gate_reason = result["reason"]
             final = result["final"]
+
+            # Google Trends cross-validation (only for high-confidence signals)
+            base_confidence = final  # Store original before adjustment
+            trends_validated = False
+            trends_data = None
+
+            TRENDS_ENABLED = os.getenv("GOOGLE_TRENDS_ENABLED", "true").lower() == "true"
+            TRENDS_MIN_CONFIDENCE = float(os.getenv("GOOGLE_TRENDS_MIN_CONFIDENCE", "0.60"))
+
+            if TRENDS_AVAILABLE and TRENDS_ENABLED and band == "HIGH" and final >= TRENDS_MIN_CONFIDENCE:
+                try:
+                    logger.info(f"[TRENDS-VALIDATION] Checking Google Trends for {brand} (confidence={final:.4f})")
+
+                    # Initialize validator (cached for efficiency)
+                    if not hasattr(main, '_trends_validator'):
+                        cache_hours = int(os.getenv("GOOGLE_TRENDS_CACHE_HOURS", "24"))
+                        main._trends_validator = GoogleTrendsValidator(cache_ttl_hours=cache_hours)
+
+                    validator = main._trends_validator
+                    trends_result = validator.validate_brand_signal(brand)
+
+                    trends_validated = trends_result['validates_signal']
+                    confidence_boost = trends_result['confidence_boost']
+
+                    # Apply boost/penalty to final confidence
+                    final = clamp(final + confidence_boost)
+
+                    # Store validation in database
+                    cur.execute("""
+                        INSERT INTO google_trends_validation (
+                            brand, checked_at, search_interest, trend_direction,
+                            validates_signal, confidence_boost, query_term, timeframe,
+                            raw_data, error_message
+                        )
+                        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    """, (
+                        brand,
+                        trends_result['search_interest'],
+                        trends_result['trend_direction'],
+                        trends_result['validates_signal'],
+                        confidence_boost,
+                        trends_result['query_term'],
+                        trends_result['timeframe'],
+                        json.dumps(trends_result['raw_data']) if trends_result['raw_data'] else None,
+                        trends_result['error_message']
+                    ))
+
+                    trends_data = {
+                        'validates_signal': trends_validated,
+                        'search_interest': float(trends_result['search_interest']),
+                        'trend_direction': trends_result['trend_direction'],
+                        'confidence_boost': float(confidence_boost),
+                        'base_confidence': float(base_confidence),
+                        'adjusted_confidence': float(final)
+                    }
+
+                    logger.info(
+                        f"[TRENDS-VALIDATION] ✓ {brand}: validates={trends_validated}, "
+                        f"direction={trends_result['trend_direction']}, "
+                        f"boost={confidence_boost:+.4f}, "
+                        f"final={base_confidence:.4f} → {final:.4f}"
+                    )
+
+                    # Re-evaluate band after adjustment
+                    if final >= 0.80:
+                        band = "HIGH"
+                    elif final >= 0.65:
+                        band = "WATCHLIST"
+                    else:
+                        band = "SUPPRESSED"
+                        gate_reason = "TRENDS_PENALTY_BELOW_THRESHOLD"
+
+                except Exception as e:
+                    logger.error(f"[TRENDS-VALIDATION] ✗ Failed for {brand}: {e}")
+                    # Continue with original confidence on error (conservative)
 
             # Emit WATCHLIST breadcrumbs for "warming up" signals
             warm, warm_reason = is_watchlist_warm(accel, intent, spread)
@@ -174,6 +270,7 @@ def main():
                     "baseline": baseline,
                     "suppression": suppression,
                 },
+                "google_trends": trends_data  # Include trends validation data
             }
 
             cur.execute("""

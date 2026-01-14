@@ -38,28 +38,44 @@ DB_CONFIG = {
     'password': os.getenv('DB_PASSWORD', 'eva_password_change_me')
 }
 
-# Brand to ticker mapping (from backtest)
-BRAND_TO_TICKER = {
-    'hoka': 'DECK',       # Deckers Outdoor (Hoka parent)
-    'on running': 'ONON',
-    'lululemon': 'LULU',
-    'crocs': 'CROX',
-    'yeti': 'YETI',
-    'duluth trading': 'DLTH',
-    'allbirds': 'BIRD',
-    'ugg': 'DECK',        # Also Deckers
-    'teva': 'DECK',       # Also Deckers
-    'columbia': 'COLM',
-    'north face': 'VFC',   # VF Corp
-    'vans': 'VFC',         # VF Corp
-    'timberland': 'VFC',   # VF Corp
-    'patagonia': None,     # Private
-    'arcteryx': 'ANTA',    # Anta Sports (Hong Kong)
-    'salomon': 'ADS.DE',   # Adidas
-    'brooks': 'BRK.A',     # Berkshire Hathaway (owner)
-    'new balance': None,   # Private
-    'carhartt': None,      # Private
-}
+# NOTE: Brand-to-ticker mapping now uses brand_ticker_mapping database table
+# This ensures we only trade publicly-listed brands where the brand is material
+# to the parent company's revenue (>5% contribution)
+
+
+def get_ticker_for_brand(conn, brand: str) -> Optional[str]:
+    """
+    Look up ticker for a brand from brand_ticker_mapping table
+
+    Args:
+        conn: Database connection
+        brand: Brand name to look up
+
+    Returns:
+        Ticker symbol if brand is publicly traded and material, None otherwise
+    """
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+    query = """
+        SELECT ticker, parent_company, material, notes
+        FROM brand_ticker_mapping
+        WHERE LOWER(TRIM(brand)) = LOWER(TRIM(%s))
+          AND ticker IS NOT NULL
+          AND material = true
+    """
+
+    cursor.execute(query, (brand,))
+    result = cursor.fetchone()
+    cursor.close()
+
+    if result:
+        logger.debug(
+            f"Found ticker {result['ticker']} for {brand} "
+            f"({result['parent_company'] or 'direct'})"
+        )
+        return result['ticker']
+
+    return None
 
 
 def get_current_price(ticker: str) -> Optional[float]:
@@ -131,11 +147,11 @@ def create_paper_trade(conn, signal: Dict[str, Any]) -> Optional[int]:
     Returns:
         Paper trade ID if created, None if skipped
     """
-    brand = signal['brand'].lower()
-    ticker = BRAND_TO_TICKER.get(brand)
+    brand = signal['brand']
+    ticker = get_ticker_for_brand(conn, brand)
 
     if ticker is None:
-        logger.info(f"⊘ Skipping {signal['brand']} - private company")
+        logger.info(f"⊘ Skipping {signal['brand']} - not publicly traded or immaterial")
         return None
 
     # Get current price
