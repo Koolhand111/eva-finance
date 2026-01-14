@@ -9,34 +9,19 @@ from __future__ import annotations
 import os
 import logging
 import subprocess
-from typing import Dict, Optional
+from typing import Dict
 import requests
-import psycopg2
-import psycopg2.extras
+from psycopg2.extras import RealDictCursor
+
+from eva_common.db import get_connection
+from eva_common.config import app_settings
 
 logger = logging.getLogger(__name__)
 
-# Environment configuration
-DB_HOST = os.getenv("POSTGRES_HOST", "localhost")
-DB_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
-DB_NAME = os.getenv("POSTGRES_DB", "eva_finance")
-DB_USER = os.getenv("POSTGRES_USER", "eva")
-DB_PASSWORD = os.environ["POSTGRES_PASSWORD"]  # Required - no default
-NTFY_URL = os.getenv("NTFY_URL", "http://eva_ntfy:80")
+# Configuration from eva_common
+NTFY_URL = app_settings.ntfy_url
 
 MAX_RETRY_ATTEMPTS = 3
-
-
-def _connect_pg():
-    """Connect to PostgreSQL with RealDictCursor."""
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-    )
-    return conn, psycopg2.extras.RealDictCursor
 
 
 def poll_and_notify() -> Dict[str, int]:
@@ -47,12 +32,11 @@ def poll_and_notify() -> Dict[str, int]:
         Dict with 'sent' and 'failed' counts
     """
     print("[EVA-NOTIFY] poll_and_notify() called", flush=True)
-    conn, cursor_cls = _connect_pg()
     stats = {"sent": 0, "failed": 0}
 
     try:
-        with conn:
-            with conn.cursor(cursor_factory=cursor_cls) as cur:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Fetch pending notifications (atomic claim)
                 cur.execute("""
                     SELECT
@@ -129,13 +113,16 @@ def poll_and_notify() -> Dict[str, int]:
                         # Trigger paper trade entry for approved signal
                         try:
                             logger.info(f"[PAPER-TRADE] Triggering paper trade entry for {brand}/{tag}")
+                            script_path = os.path.join(os.environ.get('PROJECT_ROOT', '/app'), 'scripts/paper_trading/paper_trade_entry.py')
+                            # Pass PYTHONPATH so subprocess can import eva_common
+                            env = os.environ.copy()
+                            env['PYTHONPATH'] = '/app'
                             result = subprocess.run(
-                                import os
-                                script_path = os.path.join(os.environ.get('PROJECT_ROOT', '/app'), 'scripts/paper_trading/paper_trade_entry.py')
                                 ['python3', script_path],
                                 capture_output=True,
                                 text=True,
-                                timeout=30
+                                timeout=30,
+                                env=env
                             )
 
                             if result.returncode == 0:
@@ -176,8 +163,6 @@ def poll_and_notify() -> Dict[str, int]:
         print(f"[EVA-NOTIFY] Poll/notify failed: {e}", flush=True)
         logger.error(f"[EVA-NOTIFY] Poll/notify failed: {e}")
         return stats
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

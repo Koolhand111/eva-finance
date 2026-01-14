@@ -12,7 +12,6 @@ Usage:
 Runs continuously or as a scheduled job to monitor for new tradeable signals.
 """
 
-import os
 import sys
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -22,21 +21,14 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import yfinance as yf
 
+from eva_common.db import get_connection
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Database configuration
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', 'postgres'),  # Use Docker service name, not IP
-    'port': int(os.getenv('DB_PORT', '5432')),
-    'database': os.getenv('DB_NAME', 'eva_finance'),
-    'user': os.getenv('DB_USER', 'eva'),
-    'password': os.environ['DB_PASSWORD']  # Required - no default
-}
 
 # NOTE: Brand-to-ticker mapping now uses brand_ticker_mapping database table
 # This ensures we only trade publicly-listed brands where the brand is material
@@ -230,9 +222,7 @@ def process_pending_signals():
     """
     Main processing loop: find pending signals and create paper trades
     """
-    conn = psycopg2.connect(**DB_CONFIG)
-
-    try:
+    with get_connection() as conn:
         # Get signals needing paper trades
         pending = get_pending_signals(conn)
 
@@ -256,9 +246,6 @@ def process_pending_signals():
             f"Paper trade entry complete: "
             f"{created_count} created, {skipped_count} skipped"
         )
-
-    finally:
-        conn.close()
 
 
 def main():

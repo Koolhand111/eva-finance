@@ -1,7 +1,7 @@
-psycopg2-binary
 openai
 requests
 yfinance
 pytrends==4.9.2
 pandas>=2.0.0
-pytest>=7.0.0
+# psycopg2-binary and pydantic-settings provided by eva_common
+# pytest moved to dev requirements (not needed in production image)

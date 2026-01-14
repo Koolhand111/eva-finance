@@ -1,20 +1,11 @@
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
-import os
-import psycopg2
 from psycopg2.extras import Json
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+from eva_common.db import get_connection
 
 app = FastAPI(title="EVA-Finance API")
-
-
-# ------------------------------------
-# Database Connection
-# ------------------------------------
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
 
 
 # ------------------------------------
@@ -43,35 +34,31 @@ def health():
 @app.post("/intake/message")
 def intake_message(msg: IntakeMessage):
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO raw_messages (source, platform_id, timestamp, text, url, meta)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (source, platform_id) DO NOTHING
-            RETURNING id;
-            """,
-            (
-                msg.source,
-                msg.platform_id,
-                msg.timestamp,
-                msg.text,
-                msg.url,
-                Json(msg.meta)
-            )
-        )
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO raw_messages (source, platform_id, timestamp, text, url, meta)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (source, platform_id) DO NOTHING
+                    RETURNING id;
+                    """,
+                    (
+                        msg.source,
+                        msg.platform_id,
+                        msg.timestamp,
+                        msg.text,
+                        msg.url,
+                        Json(msg.meta)
+                    )
+                )
+                result = cur.fetchone()
+                conn.commit()
 
-        if result is None:
-            # Duplicate detected, insertion was skipped
-            return {"status": "received", "duplicate": True}
+                if result is None:
+                    return {"status": "received", "duplicate": True}
 
-        new_id = result[0]
-        return {"status": "ok", "id": new_id}
+                return {"status": "ok", "id": result[0]}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -97,35 +84,34 @@ class ProcessedMessage(BaseModel):
 @app.post("/processed")
 def save_processed(msg: ProcessedMessage):
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO processed_messages 
-                (raw_id, brand, product, category, sentiment, intent, tickers, tags)
-            VALUES 
-                (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id;
-            """,
-            (
-                msg.raw_id,
-                msg.brand,
-                msg.product,
-                msg.category,
-                msg.sentiment,
-                msg.intent,
-                msg.tickers,
-                msg.tags
-            )
-        )
-        new_id = cur.fetchone()[0]
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO processed_messages
+                        (raw_id, brand, product, category, sentiment, intent, tickers, tags)
+                    VALUES
+                        (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (
+                        msg.raw_id,
+                        msg.brand,
+                        msg.product,
+                        msg.category,
+                        msg.sentiment,
+                        msg.intent,
+                        msg.tickers,
+                        msg.tags
+                    )
+                )
+                new_id = cur.fetchone()[0]
+                conn.commit()
+
+        return {"status": "ok", "id": new_id}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    return {"status": "ok", "id": new_id}
 
 @app.get("/events")
 def list_events(
@@ -133,21 +119,19 @@ def list_events(
     limit: int = Query(default=50, ge=1, le=500),
 ):
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, event_type, tag, brand, day, severity, payload, created_at, acknowledged
-            FROM signal_events
-            WHERE acknowledged = %s
-            ORDER BY id DESC
-            LIMIT %s;
-            """,
-            (ack, limit),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, event_type, tag, brand, day, severity, payload, created_at, acknowledged
+                    FROM signal_events
+                    WHERE acknowledged = %s
+                    ORDER BY id DESC
+                    LIMIT %s;
+                    """,
+                    (ack, limit),
+                )
+                rows = cur.fetchall()
 
         events = []
         for r in rows:
@@ -174,26 +158,24 @@ def list_events(
 @app.post("/events/{event_id}/ack")
 def ack_event(event_id: int):
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE signal_events
-            SET acknowledged = TRUE
-            WHERE id = %s
-            RETURNING id;
-            """,
-            (event_id,),
-        )
-        updated = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE signal_events
+                    SET acknowledged = TRUE
+                    WHERE id = %s
+                    RETURNING id;
+                    """,
+                    (event_id,),
+                )
+                updated = cur.fetchone()
+                conn.commit()
 
-        if not updated:
-            raise HTTPException(status_code=404, detail="Event not found")
+                if not updated:
+                    raise HTTPException(status_code=404, detail="Event not found")
 
-        return {"status": "ok", "id": updated[0]}
+                return {"status": "ok", "id": updated[0]}
 
     except HTTPException:
         raise

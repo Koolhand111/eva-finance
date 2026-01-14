@@ -16,7 +16,9 @@ services:
       - eva_net
 
   eva-api:
-    build: ./eva-api
+    build:
+      context: .
+      dockerfile: eva-api/Dockerfile
     container_name: eva_api
     restart: unless-stopped
     environment:
@@ -35,7 +37,9 @@ services:
       start_period: 10s
 
   eva-worker:
-    build: ./eva_worker
+    build:
+      context: .
+      dockerfile: eva_worker/Dockerfile
     container_name: eva_worker
     restart: unless-stopped
     env_file:

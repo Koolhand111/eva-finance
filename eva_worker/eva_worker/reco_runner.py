@@ -16,46 +16,16 @@ Non-goals:
 
 from __future__ import annotations
 
-import os
 import sys
 from typing import Any, Dict, Optional
 
-import psycopg2
 from psycopg2.extras import RealDictCursor
+
+from eva_common.db import get_connection
 
 # Your existing generator (already writes bundle + markdown)
 # NOTE: adjust import if your package layout differs.
 from .generate import generate_from_db
-
-
-def _build_database_url() -> str:
-    """
-    Build database connection URL.
-    Prefers DATABASE_URL if set, otherwise builds from POSTGRES_* variables.
-    """
-    # Option 1: Use DATABASE_URL if present
-    database_url = os.getenv("DATABASE_URL")
-    if database_url:
-        return database_url
-
-    # Option 2: Build from individual POSTGRES_* variables
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT", "5432")
-    db = os.getenv("POSTGRES_DB")
-    user = os.getenv("POSTGRES_USER")
-    pw = os.getenv("POSTGRES_PASSWORD")
-
-    missing = [k for k, v in {
-        "POSTGRES_HOST": host,
-        "POSTGRES_DB": db,
-        "POSTGRES_USER": user,
-        "POSTGRES_PASSWORD": pw,
-    }.items() if not v]
-
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-
-    return f"postgres://{user}:{pw}@{host}:{port}/{db}"
 
 
 PENDING_EVENT_SQL = """
@@ -106,25 +76,8 @@ ON CONFLICT (signal_event_id) DO NOTHING;
 """
 
 
-def _require_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return v
-
-
-def get_conn():
-    """
-    Connects to Postgres using either:
-      1) DATABASE_URL if present
-      2) Otherwise builds DSN from POSTGRES_* env vars
-    """
-    dsn = _build_database_url()
-    return psycopg2.connect(dsn, cursor_factory=RealDictCursor)
-
-
 def fetch_next_pending_event_id(conn) -> Optional[int]:
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(PENDING_EVENT_SQL)
         row = cur.fetchone()
         return int(row["id"]) if row else None
@@ -186,50 +139,38 @@ def main() -> int:
     - Otherwise exit 0.
     """
     try:
-        conn = get_conn()
-    except Exception as e:
-        print(f"[reco_runner] DB connection failed: {e}", file=sys.stderr)
-        return 2
+        with get_connection() as conn:
+            # Use RealDictCursor for this connection's queries
+            conn.autocommit = False
 
-    conn.autocommit = False
+            event_id = fetch_next_pending_event_id(conn)
+            if not event_id:
+                print("[reco_runner] No pending RECOMMENDATION_ELIGIBLE events.")
+                return 0
 
-    try:
-        event_id = fetch_next_pending_event_id(conn)
-        if not event_id:
-            print("[reco_runner] No pending RECOMMENDATION_ELIGIBLE events.")
-            conn.rollback()
+            print(f"[reco_runner] Found pending eligible event_id={event_id}")
+
+            # Call your existing generator.
+            # NOTE: adjust args to match your signature (seen in generate.py).
+            gen_result = generate_from_db(event_id=event_id)
+
+            draft = _normalize_generator_result(event_id, gen_result)
+
+            insert_draft_row(conn, draft)
+            conn.commit()
+
+            print(
+                "[reco_runner] Draft recorded: "
+                f"event_id={draft['signal_event_id']} "
+                f"md={draft['markdown_path']} "
+                f"bundle={draft['bundle_path']} "
+                f"sha={draft['bundle_sha256']}"
+            )
             return 0
 
-        print(f"[reco_runner] Found pending eligible event_id={event_id}")
-
-        # Call your existing generator.
-        # NOTE: adjust args to match your signature (seen in generate.py).
-        gen_result = generate_from_db(event_id=event_id)
-
-        draft = _normalize_generator_result(event_id, gen_result)
-
-        insert_draft_row(conn, draft)
-        conn.commit()
-
-        print(
-            "[reco_runner] Draft recorded: "
-            f"event_id={draft['signal_event_id']} "
-            f"md={draft['markdown_path']} "
-            f"bundle={draft['bundle_path']} "
-            f"sha={draft['bundle_sha256']}"
-        )
-        return 0
-
     except Exception as e:
-        conn.rollback()
         print(f"[reco_runner] ERROR: {e}", file=sys.stderr)
         return 1
-
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
