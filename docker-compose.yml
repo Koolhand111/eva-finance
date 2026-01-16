@@ -117,7 +117,22 @@ services:
         sleep 900;
       done'
 
-
+  # AI Infrastructure Worker - Isolated from consumer products
+  # Kill switch: AI_INFRA_ENABLED=false by default
+  eva-ai-infrastructure-worker:
+    build: ./workers/ai-infrastructure
+    container_name: eva_ai_infra_worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+      - REDDIT_USER_AGENT=EVA-Finance AI Infrastructure Monitor
+      - AI_INFRA_ENABLED=false  # KILL SWITCH - starts disabled
+    depends_on:
+      - db
+    networks:
+      - eva_net
 
 volumes:
   eva_db_data:
