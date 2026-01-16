@@ -125,10 +125,7 @@ services:
     restart: unless-stopped
     environment:
       - DATABASE_URL=${DATABASE_URL}
-      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
-      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
-      - REDDIT_USER_AGENT=EVA-Finance AI Infrastructure Monitor
-      - AI_INFRA_ENABLED=false  # KILL SWITCH - starts disabled
+      - AI_INFRA_ENABLED=true  # ENABLED - collecting data
     depends_on:
       - db
     networks:
