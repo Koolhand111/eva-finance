@@ -2,247 +2,211 @@
 
 PROJECT PURPOSE
 
-EVA-Finance detects consumer behavioral trends from Reddit discussions and validates them as investment signals through paper trading. The system ingests Reddit data via n8n workflows, extracts brand mentions and behavioral tags using LLM processing, scores signals through confidence modeling, generates AI-approved recommendations, and automatically creates paper trading positions to validate forward-looking performance. In scope: Reddit ingestion, LLM extraction, confidence scoring, AI approval, notification pipeline, paper trading validation. Out of scope: Real capital deployment, multi-source fusion (Twitter/Discord), e-commerce velocity tracking, historical backtesting (Reddit API access denied).
+EVA-Finance is a deterministic behavioral signal analysis system that extracts consumer brand sentiment from Reddit conversational data, scores signals using multi-factor confidence metrics, and generates trading recommendations validated through paper trading. The system transforms raw social mentions into actionable investment signals by detecting brand-switch patterns, sentiment shifts, and share-of-voice changes.
+
+**In-scope:**
+- Reddit ingestion (BuyItForLife, Frugal, running, fashion subreddits)
+- LLM-based extraction (GPT-4o-mini) with fallback heuristics
+- Multi-factor confidence scoring (acceleration, intent, spread, baseline, suppression)
+- Paper trading validation (Phase 0: 12-week trial, Jan-Mar 2026)
+- Brand-to-ticker mapping via FMP API
+- Notification delivery via ntfy
+
+**Out-of-scope:**
+- Live trading execution
+- Non-Reddit data sources (Twitter, news)
+- Cryptocurrency or forex signals
+- User-facing frontend
 
 MENTAL MODEL / EXECUTION ASSUMPTIONS
 
-- PostgreSQL runs in Docker container at 172.20.0.2:5432 (not localhost)
-- All database connections from host scripts must use 172.20.0.2
-- eva-worker container has volume mount to /home/koolhand/projects/eva-finance/scripts:ro for paper trading access
-- Paper trading uses simulated $1000 positions per signal, no real capital
-- Exit rules: 90 days (time), +15% (profit target), -10% (stop loss)
-- Validation criteria: Win rate ≥50%, Avg return ≥5%, ≥10 closed trades
-- Many brands map to private companies (BRAND_TO_TICKER returns None) - these are skipped
-- Signal events use UNIQUE index on (event_type, tag, brand, day) to prevent duplicates
-- Notification pipeline triggers paper trade entry via subprocess after AI approval
-- Cron jobs run on host machine (not in containers) at 4:00 PM and 4:05 PM ET weekdays
-- yfinance returns float, PostgreSQL returns Decimal - explicit type conversion required
-- ROADMAP.md defines 12-week Phase 0 validation roadmap (Week 1-12 structure)
+- All database access MUST use `eva_common.db.get_connection()` context manager (connection pooling)
+- All configuration MUST come from `eva_common.config` Pydantic settings (never hardcode credentials)
+- Brand mapping is NON-BLOCKING: FMP API failures do not crash the pipeline
+- LLM extraction has FALLBACK: if OpenAI unavailable, deterministic heuristics kick in
+- Signal deduplication via UNIQUE constraints and ON CONFLICT DO NOTHING
+- Privacy: user IDs are hashed, no PII in logs, UTC timestamps only
+- AI infrastructure worker is DISABLED by default (kill switch: `AI_INFRA_ENABLED=false`)
+- Paper trading uses $1000 position size per trade, 15% profit target, -10% stop loss, 90-day max hold
+- FMP API uses `/stable/search-name` endpoint (v3/search is deprecated since Aug 2025)
+- Environment variables use POSTGRES_* prefix (not DB_*) for database config
 
 CURRENT ARCHITECTURE
 
 **Ingest sources:**
-- n8n workflow polls Reddit subreddits (BuyItForLife, Frugal, running, sneakers, malefashionadvice, femalefashionadvice, goodyearwelt, onebag)
-- Posts inserted into raw_messages table (981 messages currently)
+- eva-ingest-reddit: Fetches from 8 subreddits every 15 minutes via Reddit public JSON API
+- n8n: External workflow automation (port 5678) posts to eva-api intake
+- eva-ai-infrastructure-worker: Isolated AI subreddit ingestion (disabled by default)
 
 **Processing pipeline:**
-- eva-worker processes raw_messages → LLM extracts brands/tags → processed_messages
-- eva_confidence_v1.py runs daily (1:05 AM cron) → computes confidence scores → behavior_states, brand_mentions tables
-- worker.py emit_trigger_events() → creates signal_events from v_trigger_tag_elevated and v_trigger_brand_divergence
-- reco_runner.py generates markdown recommendations for RECOMMENDATION_ELIGIBLE signals → recommendation_drafts table
-- ai_approval.py evaluates recommendations using gpt-4o-mini → sets notify_ready flag
-- notify.py polls recommendation_drafts for notify_ready=true → sends ntfy notifications → triggers paper_trade_entry.py
+1. Raw messages → `raw_messages` table (via eva-api POST /intake/message)
+2. eva-worker polls unprocessed rows every 10 seconds
+3. `brain_extract()` calls GPT-4o-mini or fallback heuristics
+4. Results → `processed_messages` table (brand[], tags[], sentiment, intent)
+5. `emit_trigger_events()` queries trigger views, inserts `signal_events`
+6. `poll_and_notify()` sends approved recommendations via ntfy
+7. `ensure_brands_mapped()` batch-maps brands to tickers (non-blocking)
 
 **Workers / schedulers:**
-- eva-worker container: Runs worker.py with notification polling (60s interval)
-- Cron (host): eva_confidence_v1.py daily at 1:05 AM
-- Cron (host): update_paper_prices.py weekdays 4:00 PM (market close)
-- Cron (host): check_paper_exits.py weekdays 4:05 PM
+- eva-worker: Main processing loop (10s interval), notification polling (60s interval)
+- eva-ingest-reddit: Reddit fetcher (15min loop)
+- eva-ai-infrastructure-worker: AI subreddit ingestion (disabled)
+- Cron: Paper trade updater (weekdays 4:30 PM ET), entry check (Saturdays 10 AM ET)
 
 **Persistence layer (key tables):**
-- raw_messages: Reddit data from n8n (981 rows)
-- processed_messages: LLM-extracted brands/tags (981 rows)
-- signal_events: Trigger events (2603 rows, includes TAG_ELEVATED, BRAND_DIVERGENCE, RECOMMENDATION_ELIGIBLE)
-- recommendation_drafts: AI-approved recommendations (5 rows)
-- paper_trades: Simulated positions (0 rows - no trades created yet)
-- behavior_states: Tag confidence scores
-- brand_mentions: Brand frequency tracking
+- `raw_messages`: Ingested text with source, platform_id, meta JSONB
+- `processed_messages`: Extracted brand[], tags[], sentiment, intent
+- `signal_events`: TAG_ELEVATED, BRAND_DIVERGENCE events
+- `behavior_states`: Tag state tracking (NORMAL/ELEVATED)
+- `eva_confidence_v1`: Multi-factor confidence scores
+- `brand_ticker_mapping`: Brand-to-ticker resolution with materiality flag (27 mappings)
+- `paper_trades`: Position tracking (entry, current price, exit conditions)
 
 **Output artifacts:**
-- Markdown recommendation reports (generated by reco_runner.py)
-- Gzipped evidence bundles (evidence.json.gz)
-- ntfy notifications (http://localhost:8085)
-- Paper trading logs (/home/koolhand/logs/eva/paper_*.log)
+- Signal events in `signal_events` table
+- Recommendations in `recommendation_drafts` table
+- Paper trades in `paper_trades` table
+- Notifications via ntfy (port 8085)
 
 WHAT IS WORKING (END-TO-END)
 
-- n8n Reddit ingestion → raw_messages (981 messages collected Jan 1-8, 2026)
-- LLM processing → brand/tag extraction → processed_messages (100% completion)
-- Confidence scoring → behavior_states → signal_events generation (2603 events)
-- Recommendation generation for RECOMMENDATION_ELIGIBLE signals (5 drafts created)
-- AI approval evaluation using gpt-4o-mini (approve/reject decisions with reasoning)
-- Notification pipeline → ntfy alerts when notify_ready=true
-- Paper trading entry triggered automatically after notifications (subprocess integration)
-- Cron automation for daily price updates and exit checks (scheduled, not yet tested with live positions)
-- Database migrations applied successfully (002-005)
-- Docker Compose stack running (eva_db, eva_worker, eva_ntfy, eva-api, metabase)
-- Git version control with recent commits pushed to GitHub
+- Reddit ingestion → raw_messages insertion (deterministic, idempotent)
+- LLM extraction with fallback heuristics → processed_messages
+- Trigger event emission (TAG_ELEVATED, BRAND_DIVERGENCE)
+- Confidence scoring (eva_confidence_v1.py)
+- Notification polling and delivery via ntfy
+- Paper trade entry from approved signals
+- Paper trade price updates and exit condition checking
+- Brand-ticker lookup from `brand_ticker_mapping` table (27 existing mappings)
+- Centralized config via `eva_common.config` (all services migrated)
+- Connection pooling via `eva_common.db` (ThreadedConnectionPool)
+- brand_research.py CLI tool (`--list-unmapped` works, manual mapping works)
+- FMP API integration for auto-mapping (stable endpoint working)
 
 WHAT IS PARTIALLY WORKING
 
-- Paper trading system deployed but 0 positions created (all test signals were private companies like Patagonia, Carhartt)
-- Brand-to-ticker mapping incomplete - many consumer brands return None (New Balance, Patagonia, Carhartt, North Face conglomerate issues)
-- Cron jobs configured but untested with actual open positions (need public company signals to validate)
-- Metabase dashboard exists but not configured with paper trading views
-- Historical backtest script exists (scripts/backtest/historical_backtest.py) but found 0 trends (only 8 days of data, needs 365 days)
-- PRAW backfill script created (reddit_praw_backfill.py) but waiting for Reddit API credentials
+- **Brand-to-ticker auto-mapping**: FMP API integration works, but searches company names not brand names. "Duluth Trading" → no results (needs "Duluth"), "MAC Cosmetics" → no results (subsidiary of Estée Lauder). Correctly logs for manual review via `v_unmapped_brands` view.
+- **Google Trends validation**: Integration exists but requires manual review of boost/penalty thresholds
+- **AI infrastructure worker**: Code complete and tested, but disabled by default (kill switch)
+- **Recommendation generation**: Pipeline exists but approval criteria need tuning
 
 KNOWN ISSUES / BUGS
 
-- BRAND_TO_TICKER mapping has gaps for private companies - need expanded public company coverage (20 brands → 30+ brands target)
-- Type mismatch errors fixed (PostgreSQL Decimal vs yfinance float) but requires explicit float() conversion everywhere
-- yf.download() deprecated show_errors parameter removed (fixed in update_paper_prices.py)
-- worker.py shows deleted eva_worker/notify.py in git status (file moved to eva_worker/eva_worker/notify.py, stale reference)
-- No validation with actual open positions yet - paper trading untested end-to-end with market data
-- Reddit API access denied - cannot perform historical backtest validation with real 365-day data
-- Some signals may not be materially significant (e.g., North Face = <20% of VFC revenue) - materiality scoring not implemented
+- FMP API `search-name` endpoint searches company names, not brand names. Subsidiary brands (MAC → EL, Covergirl → COTY) require manual mapping.
+- v_unmapped_brands view required DROP/CREATE due to schema mismatch with earlier test version
+- Default password in docker-compose (`eva_password_change_me`) should be rotated for production
+- Test artifacts in brand_ticker_mapping table (Duluth Trading, MAC Cosmetics marked as private incorrectly)
 
 CURRENT FOCAL PROBLEM
 
-System is fully operational but generating zero paper trading positions because detected brands are predominantly private companies. Need to either: (1) expand BRAND_TO_TICKER mapping to include more publicly-traded consumer brands, (2) wait for signals from existing public brands (Hoka/DECK, On Running/ONON, Lululemon/LULU, Crocs/CROX, etc.), or (3) tune signal detection to favor public companies. This blocks validation of paper trading system with real market data. Without open positions, cannot verify cron automation, price updates, exit checks, or 12-week validation roadmap progress.
+Brand-ticker auto-mapping has limited coverage because FMP API searches official company names, not consumer brand names. This means subsidiary brands and brands with different trading names must be manually mapped. The system correctly logs these for manual review via `v_unmapped_brands` view (showing Jordan, Osprey, Patagonia, Uniqlo as top unmapped brands), but the automation only handles pure-play companies where brand name matches company name.
 
 RECENT CHANGES
 
-**Last 2 commits (pushed to GitHub):**
-- 187adac: Add ROADMAP.md for Phase 0 validation planning (12-week roadmap, validation criteria, weekly milestones)
-- 61c874a: Add paper trading system for forward-looking validation (005_paper_trading_system.sql migration, paper_trade_entry.py, update_paper_prices.py, check_paper_exits.py, docker-compose.yml volume mount, yfinance dependency, notify.py subprocess integration)
+**Session: January 19, 2026**
+- Created `brand_mapper_service.py` with FMP API integration
+- Created migration `009_brand_ticker_mapping.sql` (table + views)
+- Integrated brand mapping into worker.py (non-blocking batch processing)
+- Fixed FMP API endpoint: `/api/v3/search` → `/stable/search-name` (legacy deprecated)
+- Fixed brand_research.py to use `eva_common.db.get_connection()` (was using wrong env vars DB_* instead of POSTGRES_*)
+- Moved test_brand_mapper.py to correct location (`eva_worker/eva_worker/`)
+- Added FMP_API_KEY to docker-compose.yml eva-worker environment
+- Added FMP settings to eva_common/config.py (fmp_api_key, fmp_enabled, fmp_rate_limit_ms)
 
-**Uncommitted changes:**
-- eva_worker/worker.py: Debug logging additions (print statements for notification poll debugging)
-- eva_worker/notify.py: Deleted file reference (moved to eva_worker/eva_worker/notify.py)
-- db/migrations/004_add_unique_constraint_for_backfill.sql: Untracked migration file
-
-**Operational changes:**
-- Cron jobs added for daily paper trading automation (4:00 PM and 4:05 PM weekdays)
-- Docker volume mount added to eva-worker container for scripts access
-- yfinance added to eva_worker/requirements.txt and container rebuilt
+**Uncommitted files:**
+- `db/migrations/009_brand_ticker_mapping.sql` (NEW)
+- `eva_worker/eva_worker/brand_mapper_service.py` (NEW)
+- `eva_worker/eva_worker/test_brand_mapper.py` (NEW)
+- `eva_worker/worker.py` (MODIFIED - brand mapper integration)
+- `eva_worker/brand_research.py` (MODIFIED - uses eva_common.db)
+- `eva_common/config.py` (MODIFIED - FMP settings)
+- `docker-compose.yml` (MODIFIED - FMP_API_KEY)
 
 NEXT STEPS (ORDERED)
 
-1. Expand BRAND_TO_TICKER mapping in scripts/paper_trading/paper_trade_entry.py with 10+ additional publicly-traded consumer brands (athletic, outdoor, fashion categories)
-2. Configure Metabase dashboard with v_paper_trading_performance, v_open_positions, v_closed_positions views for real-time monitoring (Week 1 ROADMAP.md task)
-3. Wait for signal detection on public company brands or manually test paper_trade_entry.py with synthetic signal_event_id to validate end-to-end flow
-4. Verify cron automation works correctly when first position opens (check logs at /home/koolhand/logs/eva/paper_*.log)
-5. Implement brand materiality scoring (Week 4 ROADMAP.md task) to weight high-materiality brands (>20% parent revenue) higher in confidence scoring
-6. Set up Google Trends integration (Week 1 ROADMAP.md task) for cross-validation of social signals with search interest
+1. Commit brand-ticker mapping changes (migration 009, service, worker integration)
+2. Manually map high-signal brands from `v_unmapped_brands` view (Jordan→NKE, Osprey→private, Uniqlo→FRCOY, etc.)
+3. Clean up test artifacts in brand_ticker_mapping (Duluth Trading should be DLTH not private)
+4. Build Metabase dashboard for Phase 0 validation metrics (win rate, avg return, position count)
+5. Review and tune confidence scoring thresholds based on paper trade performance
 
 INVARIANTS / RULES
 
-- Paper trades table has UNIQUE constraint on signal_event_id (one paper trade per signal)
-- signal_events table has UNIQUE index on (event_type, tag, brand, day) to prevent duplicate triggers
-- Exit rules immutable for Phase 0: 90 days OR +15% OR -10% (do not change without invalidating comparison)
-- Position size fixed at $1000 per trade for consistency
-- Database connections from host must use 172.20.0.2 (Docker container IP), never localhost
-- Cron jobs run on host machine, not inside containers (scripts must access database via 172.20.0.2)
-- Volume mount is read-only (:ro) - scripts cannot write to container filesystem
-- Paper trading logs written to /home/koolhand/logs/eva/ (not /var/log/eva - permission issues)
-- Do not modify docs/context/snapshots/EVA_CONTEXT_SNAPSHOT_PROMPT.md (this file is the prompt, not the output)
-- Validation criteria for Phase 1 GO decision: Win rate ≥50%, Avg return ≥5%, ≥10 closed trades (Week 12 ROADMAP.md)
+- Never hardcode database credentials (use eva_common.config)
+- Never use psycopg2 directly (use eva_common.db.get_connection context manager)
+- Never block pipeline on external API failures (brand mapping, Google Trends)
+- Never log PII (hash user IDs, no names/emails)
+- Financial amounts as integers (cents, not floats)
+- UTC timestamps only
+- Signal deduplication via database constraints (ON CONFLICT DO NOTHING)
+- AI infrastructure worker must remain disabled unless explicitly enabled
+- Paper trading exit rules immutable for Phase 0: 90 days OR +15% OR -10%
 
 KEY FILE LOCATIONS
 
-**Paper trading system:**
-- scripts/paper_trading/paper_trade_entry.py (creates positions, BRAND_TO_TICKER mapping)
-- scripts/paper_trading/update_paper_prices.py (daily price updater, yfinance integration)
-- scripts/paper_trading/check_paper_exits.py (exit rule checker)
-- db/migrations/005_paper_trading_system.sql (schema, views, triggers)
-
-**Worker and notification pipeline:**
-- eva_worker/worker.py (main worker loop, emit_trigger_events, notification polling)
-- eva_worker/eva_worker/notify.py (notification polling, paper trade subprocess trigger)
-- eva_worker/eva_worker/ai_approval.py (LLM-based recommendation evaluation)
-- eva_worker/eva_worker/reco_runner.py (markdown recommendation generation)
-- eva_worker/eva_worker/generate.py (LLM extraction logic)
-
-**Configuration:**
-- docker-compose.yml (service definitions, volume mounts, environment variables)
-- eva_worker/requirements.txt (Python dependencies including yfinance)
-- .env (credentials, API keys, database config)
-
-**Documentation:**
-- ROADMAP.md (12-week Phase 0 validation roadmap)
-- docs/context/snapshots/EVA_CONTEXT_SNAPSHOT.md (this file)
-- docs/context/snapshots/EVA_CONTEXT_SNAPSHOT_PROMPT.md (generation prompt - do not modify)
-
-**Backtest and data collection:**
-- scripts/backtest/historical_backtest.py (backtest validation script)
-- scripts/backtest/reddit_praw_backfill.py (PRAW-based historical data collection - waiting for credentials)
+```
+eva_common/config.py              # Pydantic settings (DB, OpenAI, FMP, Google Trends)
+eva_common/db.py                  # Connection pooling (get_connection context manager)
+eva_worker/worker.py              # Main processing loop (brain_extract, emit_trigger_events)
+eva_worker/eva_worker/brand_mapper_service.py   # FMP API integration (NEW)
+eva_worker/eva_worker/notify.py   # Notification polling and paper trade triggering
+eva_worker/brand_research.py      # CLI tool for manual brand mapping
+eva_worker/eva_confidence_v1.py   # Confidence scoring computation
+scripts/paper_trading/paper_trade_entry.py      # Paper trade creation
+db/migrations/009_brand_ticker_mapping.sql      # Brand mapping schema (NEW)
+db/init.sql                       # Core schema
+docker-compose.yml                # Service orchestration
+.env                              # Secrets (OPENAI_API_KEY, FMP_API_KEY, DB creds)
+```
 
 QUICK START (RESTORE CONTEXT)
 
-**Verify system health:**
 ```bash
-cd /home/koolhand/projects/eva-finance
-docker ps  # Verify eva_db, eva_worker, eva_ntfy, eva-api running
-docker logs eva_worker --tail 50  # Check worker activity
-crontab -l | grep paper  # Verify cron jobs configured
-```
+# Verify system health
+docker compose ps
+docker exec eva_worker python -c "from eva_common.db import get_connection; print('DB OK')"
+docker exec eva_db psql -U eva -d eva_finance -c "SELECT COUNT(*) FROM brand_ticker_mapping;"
 
-**Inspect current state:**
-```bash
-# Check data pipeline
-docker exec eva_db psql -U eva -d eva_finance -c "
-SELECT COUNT(*) as count, 'raw_messages' as table FROM raw_messages
-UNION ALL SELECT COUNT(*), 'processed_messages' FROM processed_messages
-UNION ALL SELECT COUNT(*), 'signal_events' FROM signal_events
-UNION ALL SELECT COUNT(*), 'recommendation_drafts' FROM recommendation_drafts
-UNION ALL SELECT COUNT(*), 'paper_trades' FROM paper_trades;
-"
+# Check brand mapping service
+docker exec eva_worker python -m eva_worker.test_brand_mapper
 
-# Check paper trading performance
-docker exec eva_db psql -U eva -d eva_finance -c "SELECT * FROM v_paper_trading_performance;"
+# List unmapped brands needing research
+docker exec eva_worker python /app/brand_research.py --list-unmapped
 
-# Check open positions
-docker exec eva_db psql -U eva -d eva_finance -c "SELECT * FROM v_open_positions;"
+# Add a brand mapping manually
+docker exec eva_worker python /app/brand_research.py "Jordan" "NKE" --parent "Nike Inc" --material --exchange NYSE
 
-# Check recent signals
-docker exec eva_db psql -U eva -d eva_finance -c "
-SELECT id, event_type, brand, tag, day, severity
-FROM signal_events
-ORDER BY created_at DESC
-LIMIT 10;
-"
-```
+# Check worker logs for brand mapping activity
+docker compose logs eva-worker --tail=50 | grep -i brand
 
-**Run critical manual steps (if needed):**
-```bash
-# Test paper trade entry manually
-cd /home/koolhand/projects/eva-finance/scripts/paper_trading
-python3 paper_trade_entry.py
+# Query recent mappings
+docker exec eva_db psql -U eva -d eva_finance -c "SELECT brand, ticker, material FROM brand_ticker_mapping ORDER BY updated_at DESC LIMIT 10;"
 
-# Test price updater (will fail if no open positions)
-python3 update_paper_prices.py
-
-# Test exit checker
-python3 check_paper_exits.py
-
-# Check paper trading logs
-tail -f /home/koolhand/logs/eva/paper_prices.log
-tail -f /home/koolhand/logs/eva/paper_exits.log
-```
-
-**Git status:**
-```bash
-git status  # Check uncommitted changes
-git log --oneline -5  # Recent commits
+# Rebuild and restart worker after changes
+docker compose build eva-worker && docker compose up -d eva-worker
 ```
 
 ENVIRONMENT
 
-- **OS:** Linux (Ubuntu-based, kernel 6.8.0-90-generic)
-- **Runtime versions:**
-  - Python: 3.12 (eva_worker container and host)
-  - PostgreSQL: 16 (Docker container)
-  - Docker Compose: v2.x
+- **OS:** Linux 6.8.0-90-generic (Ubuntu)
+- **Runtime:** Python 3.12-slim (Docker containers)
+- **Database:** PostgreSQL 16 (container: eva_db)
 - **Services:**
-  - eva_db (postgres:16) - port 5432 internal, IP 172.20.0.2
-  - eva_worker (Python worker) - runs worker.py with notification polling
-  - eva_ntfy (ntfy server) - port 8085 exposed
-  - eva-api (FastAPI) - port 9080 exposed
-  - eva_metabase (Metabase) - port 3000 exposed
-- **External dependencies:**
-  - OpenAI API (gpt-4o-mini for LLM extraction and AI approval)
-  - yfinance (Yahoo Finance API for stock prices)
-  - n8n (Reddit workflow ingestion) - http://10.10.0.210:5678/
-- **Cron schedule:**
-  - 1:05 AM daily: eva_confidence_v1.py (confidence scoring)
-  - 4:00 PM Mon-Fri: update_paper_prices.py (price updates)
-  - 4:05 PM Mon-Fri: check_paper_exits.py (exit rule checks)
+  - eva_db: postgres:16 (internal 5432)
+  - eva_api: FastAPI on port 9080
+  - eva_worker: background processing (no port)
+  - eva_ntfy: ntfy on port 8085
+  - metabase: port 3000
+  - n8n: port 5678 (external, connected to eva_net)
+- **External APIs:**
+  - OpenAI: GPT-4o-mini for extraction
+  - FMP: Financial Modeling Prep for ticker lookup (stable API)
+  - Reddit: Public JSON API (no auth required)
 
 STATUS
 
-Phase 0 validation system fully operational but blocked on generating paper trading positions from public company signals (0 positions created, need brand coverage expansion or public brand signals).
+System operational. Brand-ticker auto-mapping service deployed and tested. FMP API integration working with stable endpoint. Manual mapping required for subsidiary brands. 27 brands mapped, 20+ high-signal brands awaiting manual research. Ready to commit changes and expand brand coverage.
 
 LAST UPDATED
 
-2026-01-09
+2026-01-19
