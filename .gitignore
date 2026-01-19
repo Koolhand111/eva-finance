@@ -15,3 +15,11 @@ __pycache__/
 # Backtest output files
 backtest_*.json
 backtest_*.csv
+
+# Personal Claude Code overrides
+CLAUDE.local.md
+
+# Secrets
+secrets/
+*.key
+*.pem

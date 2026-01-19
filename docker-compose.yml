@@ -16,7 +16,9 @@ services:
       - eva_net
 
   eva-api:
-    build: ./eva-api
+    build:
+      context: .
+      dockerfile: eva-api/Dockerfile
     container_name: eva_api
     restart: unless-stopped
     environment:
@@ -35,7 +37,9 @@ services:
       start_period: 10s
 
   eva-worker:
-    build: ./eva_worker
+    build:
+      context: .
+      dockerfile: eva_worker/Dockerfile
     container_name: eva_worker
     restart: unless-stopped
     env_file:
@@ -43,6 +47,7 @@ services:
     environment:
       NOTIFICATION_POLL_INTERVAL: 60
       NTFY_URL: http://eva_ntfy:80
+      FMP_API_KEY: ${FMP_API_KEY}
     depends_on:
       - db
     networks:
@@ -113,7 +118,19 @@ services:
         sleep 900;
       done'
 
-
+  # AI Infrastructure Worker - Isolated from consumer products
+  # Kill switch: AI_INFRA_ENABLED=false by default
+  eva-ai-infrastructure-worker:
+    build: ./workers/ai-infrastructure
+    container_name: eva_ai_infra_worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - AI_INFRA_ENABLED=true  # ENABLED - collecting data
+    depends_on:
+      - db
+    networks:
+      - eva_net
 
 volumes:
   eva_db_data:

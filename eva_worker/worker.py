@@ -1,9 +1,10 @@
-import os
 import time
 import json
 import logging
-import psycopg2
 from openai import OpenAI
+
+from eva_common.db import get_connection
+from eva_common.config import app_settings
 
 # Configure logging
 logging.basicConfig(
@@ -19,81 +20,75 @@ except ImportError:
     logger.warning("Could not import poll_and_notify - notification polling disabled")
     poll_and_notify = None
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgres://eva:eva_password_change_me@db:5432/eva_finance",
-)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Import brand mapper service for automatic ticker lookups
+try:
+    from eva_worker.brand_mapper_service import ensure_brands_mapped, get_mapper
+    brand_mapper_enabled = True
+except ImportError:
+    logger.warning("Could not import brand_mapper_service - brand mapping disabled")
+    brand_mapper_enabled = False
+    ensure_brands_mapped = None
+    get_mapper = None
 
-MODEL_NAME = os.getenv("EVA_MODEL", "gpt-4o-mini")
+# Configuration from eva_common
+MODEL_NAME = app_settings.eva_model
 PROCESSOR_LLM = f"llm:{MODEL_NAME}:v1"
 PROCESSOR_FALLBACK = "fallback:v1"
+NOTIFICATION_POLL_INTERVAL = app_settings.notification_poll_interval
 
-# Notification polling interval (seconds)
-NOTIFICATION_POLL_INTERVAL = int(os.getenv("NOTIFICATION_POLL_INTERVAL", "60"))
-
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+client = OpenAI(api_key=app_settings.openai_api_key) if app_settings.openai_api_key else None
 
 def emit_trigger_events():
     """
     Emit signal events based on trigger views.
     Uses a UNIQUE index on signal_events to prevent duplicates.
     """
-    conn = get_conn()
-    cur = conn.cursor()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # ---- Trigger A: Tag Elevated ----
+            cur.execute("""
+                SELECT tag, day, confidence
+                FROM v_trigger_tag_elevated
+                ORDER BY day DESC;
+            """)
+            elevated = cur.fetchall()
 
-    # ---- Trigger A: Tag Elevated (fires as soon as behavior_states has ELEVATED tags) ----
-    cur.execute("""
-        SELECT tag, day, confidence
-        FROM v_trigger_tag_elevated
-        ORDER BY day DESC;
-    """)
-    elevated = cur.fetchall()
+            for tag, day, confidence in elevated:
+                cur.execute("""
+                    INSERT INTO signal_events (event_type, tag, day, severity, payload)
+                    VALUES (%s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT DO NOTHING;
+                """, (
+                    "TAG_ELEVATED",
+                    tag,
+                    day,
+                    "warning",
+                    json.dumps({"confidence": float(confidence)})
+                ))
 
-    for tag, day, confidence in elevated:
-        cur.execute("""
-            INSERT INTO signal_events (event_type, tag, day, severity, payload)
-            VALUES (%s, %s, %s, %s, %s::jsonb)
-            ON CONFLICT DO NOTHING;
-        """, (
-            "TAG_ELEVATED",
-            tag,
-            day,
-            "warning",
-            json.dumps({"confidence": float(confidence)})
-        ))
+            # ---- Trigger B: Brand Divergence ----
+            cur.execute("""
+                SELECT tag_name, brand_name, day, delta_pct
+                FROM v_trigger_brand_divergence
+                ORDER BY day DESC;
+            """)
+            divergence = cur.fetchall()
 
-    # ---- Trigger B: Brand Divergence (may be empty until you have multi-day share movement) ----
-    cur.execute("""
-        SELECT tag_name, brand_name, day, delta_pct
-        FROM v_trigger_brand_divergence
-        ORDER BY day DESC;
-    """)
-    divergence = cur.fetchall()
+            for tag_name, brand_name, day, delta_pct in divergence:
+                cur.execute("""
+                    INSERT INTO signal_events (event_type, tag, brand, day, severity, payload)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT DO NOTHING;
+                """, (
+                    "BRAND_DIVERGENCE",
+                    tag_name,
+                    brand_name,
+                    day,
+                    "warning",
+                    json.dumps({"delta_pct": float(delta_pct)})
+                ))
 
-    for tag_name, brand_name, day, delta_pct in divergence:
-        cur.execute("""
-            INSERT INTO signal_events (event_type, tag, brand, day, severity, payload)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-            ON CONFLICT DO NOTHING;
-        """, (
-            "BRAND_DIVERGENCE",
-            tag_name,
-            brand_name,
-            day,
-            "warning",
-            json.dumps({"delta_pct": float(delta_pct)})
-        ))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-
-
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+            conn.commit()
 
 
 def fallback_brain_extract(raw_id: int, text: str):
@@ -301,72 +296,91 @@ Output JSON only. No markdown. No extra fields.
 
 def process_batch(limit: int = 20) -> int:
     # 1) Fetch unprocessed rows
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, text
-        FROM raw_messages
-        WHERE processed = FALSE
-        ORDER BY id ASC
-        LIMIT %s;
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, text
+                FROM raw_messages
+                WHERE processed = FALSE
+                ORDER BY id ASC
+                LIMIT %s;
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
 
     if not rows:
         return 0
 
     # 2) Process each row
     count = 0
+    brands_to_map = []  # Collect brands for batch mapping
+
     for raw_id, text in rows:
         try:
             data = brain_extract(raw_id, text)
 
-            conn = get_conn()
-            cur = conn.cursor()
+            # Collect brands for mapping (non-blocking)
+            if data.get("brand"):
+                brands_to_map.extend(data["brand"])
 
-            # Insert processed row
-            cur.execute(
-                """
-                INSERT INTO processed_messages
-                  (raw_id, brand, product, category, sentiment, intent, tickers, tags, processor_version)
-                VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id;
-                """,
-                (
-                    data["raw_id"],
-                    data["brand"],
-                    data["product"],
-                    data["category"],
-                    data["sentiment"],
-                    data["intent"],
-                    data["tickers"],
-                    data["tags"],
-                    data["processor_version"],
-                ),
-            )
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Insert processed row
+                    cur.execute(
+                        """
+                        INSERT INTO processed_messages
+                          (raw_id, brand, product, category, sentiment, intent, tickers, tags, processor_version)
+                        VALUES
+                          (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id;
+                        """,
+                        (
+                            data["raw_id"],
+                            data["brand"],
+                            data["product"],
+                            data["category"],
+                            data["sentiment"],
+                            data["intent"],
+                            data["tickers"],
+                            data["tags"],
+                            data["processor_version"],
+                        ),
+                    )
 
-            _new_id = cur.fetchone()[0]
+                    _new_id = cur.fetchone()[0]
 
-            # Mark raw processed
-            cur.execute(
-                "UPDATE raw_messages SET processed = TRUE WHERE id = %s;",
-                (raw_id,),
-            )
+                    # Mark raw processed
+                    cur.execute(
+                        "UPDATE raw_messages SET processed = TRUE WHERE id = %s;",
+                        (raw_id,),
+                    )
 
-            conn.commit()
-            cur.close()
-            conn.close()
+                    conn.commit()
 
             count += 1
 
         except Exception as e:
             print(f"[EVA-WORKER] Failed processing raw_id={raw_id}: {e}")
+
+    # 3) Batch map brands to tickers (non-blocking)
+    if brands_to_map and brand_mapper_enabled and ensure_brands_mapped:
+        try:
+            unique_brands = list(set(brands_to_map))
+            results = ensure_brands_mapped(unique_brands)
+            mapped_count = sum(
+                1 for r in results.values()
+                if r.status.value in ("already_mapped", "mapped_success")
+            )
+            if mapped_count > 0 or len(results) > 0:
+                logger.debug(
+                    f"[EVA-WORKER] Brand mapping: {mapped_count}/{len(unique_brands)} "
+                    f"brands mapped/cached"
+                )
+        except Exception as e:
+            # Non-blocking: log and continue
+            logger.warning(f"[EVA-WORKER] Brand mapping failed (non-blocking): {e}")
 
     return count
 
