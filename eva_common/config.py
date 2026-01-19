@@ -86,6 +86,11 @@ class AppSettings(BaseSettings):
     google_trends_min_confidence: float = 0.60
     google_trends_rate_limit_per_hour: int = 60
 
+    # Financial Modeling Prep API (brand-ticker mapping)
+    fmp_api_key: Optional[str] = None
+    fmp_enabled: bool = True
+    fmp_rate_limit_ms: int = 500  # Minimum ms between API calls
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

@@ -47,6 +47,7 @@ services:
     environment:
       NOTIFICATION_POLL_INTERVAL: 60
       NTFY_URL: http://eva_ntfy:80
+      FMP_API_KEY: ${FMP_API_KEY}
     depends_on:
       - db
     networks:

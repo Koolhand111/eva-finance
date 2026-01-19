@@ -9,19 +9,10 @@ Usage:
 
 import yfinance as yf
 import argparse
-import psycopg2
 from psycopg2.extras import RealDictCursor
-import os
 from typing import Optional, Dict
 
-def get_db_connection():
-    """Get database connection"""
-    return psycopg2.connect(
-        host=os.getenv('DB_HOST', 'eva_db'),
-        database=os.getenv('DB_NAME', 'eva_finance'),
-        user=os.getenv('DB_USER', 'eva'),
-        password=os.getenv('DB_PASSWORD', 'eva_finance')
-    )
+from eva_common.db import get_connection
 
 def research_ticker(ticker: str) -> Dict:
     """
@@ -58,24 +49,23 @@ def add_brand_mapping(
     notes: Optional[str]
 ):
     """Add brand-ticker mapping to database"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-
     try:
-        cur.execute("""
-            INSERT INTO brand_ticker_mapping
-            (brand, ticker, parent_company, material, exchange, notes)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (brand) DO UPDATE SET
-                ticker = EXCLUDED.ticker,
-                parent_company = EXCLUDED.parent_company,
-                material = EXCLUDED.material,
-                exchange = EXCLUDED.exchange,
-                notes = EXCLUDED.notes,
-                updated_at = NOW()
-        """, (brand, ticker, parent_company, material, exchange, notes))
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO brand_ticker_mapping
+                    (brand, ticker, parent_company, material, exchange, notes)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (brand) DO UPDATE SET
+                        ticker = EXCLUDED.ticker,
+                        parent_company = EXCLUDED.parent_company,
+                        material = EXCLUDED.material,
+                        exchange = EXCLUDED.exchange,
+                        notes = EXCLUDED.notes,
+                        updated_at = NOW()
+                """, (brand, ticker, parent_company, material, exchange, notes))
+                conn.commit()
 
-        conn.commit()
         print(f"✅ Added mapping: {brand} → {ticker or 'PRIVATE'}")
 
         # Verify ticker if provided
@@ -89,19 +79,14 @@ def add_brand_mapping(
                 print(f"   ⚠️  Warning: Could not verify ticker {ticker}")
 
     except Exception as e:
-        conn.rollback()
         print(f"❌ Error: {e}")
-    finally:
-        cur.close()
-        conn.close()
 
 def list_unmapped_brands():
     """Show brands that need ticker mapping"""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-
-    cur.execute("SELECT * FROM v_unmapped_brands LIMIT 20")
-    brands = cur.fetchall()
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM v_unmapped_brands LIMIT 20")
+            brands = cur.fetchall()
 
     print("\n🔍 Brands Needing Research (Top 20):\n")
     print(f"{'Brand':<20} {'Signals':<10} {'Max Confidence':<15}")
@@ -109,9 +94,6 @@ def list_unmapped_brands():
 
     for b in brands:
         print(f"{b['brand']:<20} {b['signal_count']:<10} {b['max_confidence'] or 0.0:<15.4f}")
-
-    cur.close()
-    conn.close()
 
 def main():
     parser = argparse.ArgumentParser(description='Research and add brand-ticker mappings')

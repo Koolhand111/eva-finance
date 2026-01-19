@@ -20,6 +20,16 @@ except ImportError:
     logger.warning("Could not import poll_and_notify - notification polling disabled")
     poll_and_notify = None
 
+# Import brand mapper service for automatic ticker lookups
+try:
+    from eva_worker.brand_mapper_service import ensure_brands_mapped, get_mapper
+    brand_mapper_enabled = True
+except ImportError:
+    logger.warning("Could not import brand_mapper_service - brand mapping disabled")
+    brand_mapper_enabled = False
+    ensure_brands_mapped = None
+    get_mapper = None
+
 # Configuration from eva_common
 MODEL_NAME = app_settings.eva_model
 PROCESSOR_LLM = f"llm:{MODEL_NAME}:v1"
@@ -305,9 +315,15 @@ def process_batch(limit: int = 20) -> int:
 
     # 2) Process each row
     count = 0
+    brands_to_map = []  # Collect brands for batch mapping
+
     for raw_id, text in rows:
         try:
             data = brain_extract(raw_id, text)
+
+            # Collect brands for mapping (non-blocking)
+            if data.get("brand"):
+                brands_to_map.extend(data["brand"])
 
             with get_connection() as conn:
                 with conn.cursor() as cur:
@@ -347,6 +363,24 @@ def process_batch(limit: int = 20) -> int:
 
         except Exception as e:
             print(f"[EVA-WORKER] Failed processing raw_id={raw_id}: {e}")
+
+    # 3) Batch map brands to tickers (non-blocking)
+    if brands_to_map and brand_mapper_enabled and ensure_brands_mapped:
+        try:
+            unique_brands = list(set(brands_to_map))
+            results = ensure_brands_mapped(unique_brands)
+            mapped_count = sum(
+                1 for r in results.values()
+                if r.status.value in ("already_mapped", "mapped_success")
+            )
+            if mapped_count > 0 or len(results) > 0:
+                logger.debug(
+                    f"[EVA-WORKER] Brand mapping: {mapped_count}/{len(unique_brands)} "
+                    f"brands mapped/cached"
+                )
+        except Exception as e:
+            # Non-blocking: log and continue
+            logger.warning(f"[EVA-WORKER] Brand mapping failed (non-blocking): {e}")
 
     return count
 
