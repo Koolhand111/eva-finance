@@ -35,7 +35,6 @@ CURRENT ARCHITECTURE
 
 **Ingest sources:**
 - eva-ingest-reddit: Fetches from 8 subreddits every 15 minutes via Reddit public JSON API
-- n8n: External workflow automation (port 5678) posts to eva-api intake
 - eva-ai-infrastructure-worker: Isolated AI subreddit ingestion (disabled by default)
 
 **Processing pipeline:**
