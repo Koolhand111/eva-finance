@@ -12,7 +12,6 @@ Detect behavioral trend signals early using conversational data.
 - eva_worker/worker.py — ingestion + extraction
 - eva_worker/scoring.py — signal scoring logic
 - db/views/*.sql — signal derivations
-- n8n/workflows — alerting & notifications
 
 ## Design Decisions
 - LLM first, heuristics second
