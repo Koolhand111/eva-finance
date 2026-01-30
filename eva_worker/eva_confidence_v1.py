@@ -6,7 +6,12 @@ from psycopg2.extras import RealDictCursor
 
 # Google Trends cross-validation
 try:
-    from eva_worker.google_trends import GoogleTrendsValidator
+    from eva_worker.google_trends import (
+        GoogleTrendsValidator,
+        validate_brand_non_blocking,
+        log_metrics as log_trends_metrics,
+        get_metrics as get_trends_metrics
+    )
     TRENDS_AVAILABLE = True
 except ImportError:
     TRENDS_AVAILABLE = False
@@ -170,15 +175,19 @@ def main():
                         main._trends_validator = GoogleTrendsValidator(cache_ttl_hours=cache_hours)
 
                     validator = main._trends_validator
-                    trends_result = validator.validate_brand_signal(brand)
 
+                    # Use non-blocking validation (returns pending on rate limits)
+                    trends_result = validate_brand_non_blocking(brand, validator=validator)
+
+                    validation_status = trends_result.get('validation_status', 'completed')
                     trends_validated = trends_result['validates_signal']
                     confidence_boost = trends_result['confidence_boost']
 
-                    # Apply boost/penalty to final confidence
-                    final = clamp(final + confidence_boost)
+                    # Only apply boost/penalty if validation completed (not pending)
+                    if validation_status == 'completed':
+                        final = clamp(final + confidence_boost)
 
-                    # Store validation in database
+                    # Store validation in database (include validation_status)
                     cur.execute("""
                         INSERT INTO google_trends_validation (
                             brand, checked_at, search_interest, trend_direction,
@@ -204,24 +213,32 @@ def main():
                         'trend_direction': trends_result['trend_direction'],
                         'confidence_boost': float(confidence_boost),
                         'base_confidence': float(base_confidence),
-                        'adjusted_confidence': float(final)
+                        'adjusted_confidence': float(final),
+                        'validation_status': validation_status
                     }
 
-                    logger.info(
-                        f"[TRENDS-VALIDATION] ✓ {brand}: validates={trends_validated}, "
-                        f"direction={trends_result['trend_direction']}, "
-                        f"boost={confidence_boost:+.4f}, "
-                        f"final={base_confidence:.4f} → {final:.4f}"
-                    )
-
-                    # Re-evaluate band after adjustment
-                    if final >= 0.80:
-                        band = "HIGH"
-                    elif final >= 0.65:
-                        band = "WATCHLIST"
+                    if validation_status == 'pending':
+                        logger.info(
+                            f"[TRENDS-VALIDATION] ⏳ {brand}: pending (rate limited), "
+                            f"proceeding without trends adjustment"
+                        )
                     else:
-                        band = "SUPPRESSED"
-                        gate_reason = "TRENDS_PENALTY_BELOW_THRESHOLD"
+                        logger.info(
+                            f"[TRENDS-VALIDATION] ✓ {brand}: validates={trends_validated}, "
+                            f"direction={trends_result['trend_direction']}, "
+                            f"boost={confidence_boost:+.4f}, "
+                            f"final={base_confidence:.4f} → {final:.4f}"
+                        )
+
+                    # Re-evaluate band after adjustment (only if completed)
+                    if validation_status == 'completed':
+                        if final >= 0.80:
+                            band = "HIGH"
+                        elif final >= 0.65:
+                            band = "WATCHLIST"
+                        else:
+                            band = "SUPPRESSED"
+                            gate_reason = "TRENDS_PENALTY_BELOW_THRESHOLD"
 
                 except Exception as e:
                     logger.error(f"[TRENDS-VALIDATION] ✗ Failed for {brand}: {e}")
@@ -308,6 +325,13 @@ def main():
                 """, (tag, brand, day, final))
 
     print(f"Scored {len(rows)} candidate(s) into eva_confidence_v1.")
+
+    # Log Google Trends metrics at end of run
+    if TRENDS_AVAILABLE:
+        try:
+            log_trends_metrics()
+        except Exception as e:
+            logger.warning(f"[TRENDS-METRICS] Failed to log metrics: {e}")
 
 
 if __name__ == "__main__":

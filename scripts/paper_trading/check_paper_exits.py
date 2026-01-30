@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # Database configuration
 DB_CONFIG = {
-    'host': os.getenv('DB_HOST', '172.20.0.2'),
+    'host': os.getenv('DB_HOST', 'db'),
     'port': int(os.getenv('DB_PORT', '5432')),
     'database': os.getenv('DB_NAME', 'eva_finance'),
     'user': os.getenv('DB_USER', 'eva'),

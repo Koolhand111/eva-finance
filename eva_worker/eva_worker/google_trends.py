@@ -15,11 +15,31 @@ Usage:
 import os
 import logging
 import time
+import random
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# Rate limiting configuration
+MAX_RETRIES = int(os.getenv("GOOGLE_TRENDS_MAX_RETRIES", "3"))
+BASE_DELAY_SECONDS = float(os.getenv("GOOGLE_TRENDS_BASE_DELAY", "5.0"))  # Increased from 2.0
+MAX_DELAY_SECONDS = float(os.getenv("GOOGLE_TRENDS_MAX_DELAY", "120.0"))  # Increased from 60.0
+REQUEST_DELAY_SECONDS = float(os.getenv("GOOGLE_TRENDS_REQUEST_DELAY", "5.0"))  # Increased from 1.5
+
+# Track last request time for global rate limiting
+_last_request_time: float = 0.0
+
+# Metrics tracking
+_metrics = {
+    'total_requests': 0,
+    'successful_requests': 0,
+    'failed_requests': 0,
+    'rate_limited_requests': 0,
+    'cache_hits': 0,
+    'retry_attempts': 0,
+}
 
 # In-memory cache (no Redis infrastructure)
 _trends_cache: Dict[str, Dict] = {}
@@ -80,6 +100,57 @@ class TrendsCache:
         return len(_trends_cache)
 
 
+def get_metrics() -> Dict:
+    """Return current metrics for monitoring."""
+    return _metrics.copy()
+
+
+def reset_metrics():
+    """Reset metrics (for testing)."""
+    global _metrics
+    _metrics = {
+        'total_requests': 0,
+        'successful_requests': 0,
+        'failed_requests': 0,
+        'rate_limited_requests': 0,
+        'cache_hits': 0,
+        'retry_attempts': 0,
+    }
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    """
+    Detect if an exception is a rate limit (429) error.
+
+    pytrends wraps HTTP errors in various ways, so we check multiple patterns.
+    """
+    error_str = str(error).lower()
+
+    # Common rate limit indicators
+    rate_limit_patterns = [
+        '429',
+        'too many requests',
+        'rate limit',
+        'quota exceeded',
+        'temporarily blocked',
+        'google returned a response with code 429',
+    ]
+
+    return any(pattern in error_str for pattern in rate_limit_patterns)
+
+
+def _calculate_backoff_delay(attempt: int) -> float:
+    """
+    Calculate exponential backoff delay with jitter.
+
+    Formula: min(base * 2^attempt + jitter, max_delay)
+    Jitter: random 0-25% of calculated delay
+    """
+    delay = BASE_DELAY_SECONDS * (2 ** attempt)
+    jitter = delay * random.uniform(0, 0.25)
+    return min(delay + jitter, MAX_DELAY_SECONDS)
+
+
 class GoogleTrendsValidator:
     """
     Validates brand signals using Google Trends search interest data.
@@ -105,15 +176,21 @@ class GoogleTrendsValidator:
         self._init_pytrends()
 
     def _init_pytrends(self):
-        """Initialize pytrends with retry logic."""
+        """Initialize pytrends client with fresh session."""
         try:
             from pytrends.request import TrendReq
 
-            # Initialize (simpler config due to urllib3 compatibility)
+            # Create fresh TrendReq instance with clean session
+            # Note: We handle retries ourselves in _fetch_with_retry()
             self.pytrends = TrendReq(
                 hl='en-US',
                 tz=360,  # US timezone offset
-                timeout=(10, 25)  # (connect, read) timeouts
+                timeout=(10, 30),  # (connect, read) timeouts
+                requests_args={
+                    'headers': {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    }
+                }
             )
             logger.info("[TRENDS] pytrends initialized successfully")
 
@@ -123,6 +200,79 @@ class GoogleTrendsValidator:
         except Exception as e:
             logger.error(f"[TRENDS] Failed to initialize pytrends: {e}")
             self.pytrends = None
+
+    def _reset_session(self):
+        """Reset pytrends session to clear any rate limit state."""
+        logger.info("[TRENDS] Resetting pytrends session...")
+        self._init_pytrends()
+
+    def _fetch_with_retry(self, brand: str, timeframe: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        """
+        Fetch Google Trends data with exponential backoff retry on rate limits.
+
+        Returns:
+            Tuple of (DataFrame or None, error_message or None)
+        """
+        global _last_request_time
+        last_error = None
+
+        for attempt in range(MAX_RETRIES + 1):  # +1 for initial attempt
+            try:
+                _metrics['total_requests'] += 1
+
+                # Enforce minimum delay between ALL requests (global rate limiting)
+                time_since_last = time.time() - _last_request_time
+                if time_since_last < REQUEST_DELAY_SECONDS:
+                    wait_time = REQUEST_DELAY_SECONDS - time_since_last
+                    logger.debug(f"[TRENDS] Waiting {wait_time:.1f}s before request (rate limiting)")
+                    time.sleep(wait_time)
+
+                _last_request_time = time.time()
+
+                self.pytrends.build_payload(
+                    kw_list=[brand],
+                    timeframe=timeframe,
+                    geo='US',
+                    gprop=''
+                )
+
+                df = self.pytrends.interest_over_time()
+                _metrics['successful_requests'] += 1
+                return df, None
+
+            except Exception as e:
+                last_error = e
+
+                if _is_rate_limit_error(e):
+                    _metrics['rate_limited_requests'] += 1
+
+                    if attempt < MAX_RETRIES:
+                        delay = _calculate_backoff_delay(attempt)
+                        _metrics['retry_attempts'] += 1
+                        logger.warning(
+                            f"[TRENDS] Rate limited for '{brand}' (attempt {attempt + 1}/{MAX_RETRIES + 1}). "
+                            f"Retrying in {delay:.1f}s with session reset..."
+                        )
+                        # Reset session on rate limit to clear any cookies/state
+                        self._reset_session()
+                        time.sleep(delay)
+                        _last_request_time = time.time()  # Update after sleep
+                        continue
+                    else:
+                        logger.error(
+                            f"[TRENDS] Rate limit exceeded for '{brand}' after {MAX_RETRIES + 1} attempts"
+                        )
+                        _metrics['failed_requests'] += 1
+                        return None, f"Rate limit exceeded after {MAX_RETRIES + 1} attempts"
+                else:
+                    # Non-rate-limit error - don't retry
+                    _metrics['failed_requests'] += 1
+                    logger.error(f"[TRENDS] API error for '{brand}': {e}")
+                    return None, f"API error: {str(e)}"
+
+        # Should not reach here, but safety fallback
+        _metrics['failed_requests'] += 1
+        return None, f"Failed after {MAX_RETRIES + 1} attempts: {str(last_error)}"
 
     def validate_brand_signal(
         self,
@@ -155,6 +305,7 @@ class GoogleTrendsValidator:
         if use_cache:
             cached = self.cache.get(brand)
             if cached is not None:
+                _metrics['cache_hits'] += 1
                 return cached
 
         # Validate inputs
@@ -164,62 +315,52 @@ class GoogleTrendsValidator:
         if self.pytrends is None:
             return self._error_result(brand, timeframe, "pytrends not initialized")
 
-        # Fetch trends data
-        try:
-            logger.info(f"[TRENDS] Fetching data for '{brand}' ({timeframe})")
+        # Fetch trends data with retry logic
+        logger.info(f"[TRENDS] Fetching data for '{brand}' ({timeframe})")
 
-            # Build payload and fetch interest over time
-            self.pytrends.build_payload(
-                kw_list=[brand],
-                timeframe=timeframe,
-                geo='US',  # Focus on US market
-                gprop=''   # Web search (not images, news, etc.)
-            )
+        df, error_msg = self._fetch_with_retry(brand, timeframe)
 
-            df = self.pytrends.interest_over_time()
-
-            if df.empty or brand not in df.columns:
-                logger.warning(f"[TRENDS] No data returned for '{brand}'")
-                return self._error_result(brand, timeframe, f"No search data for '{brand}'")
-
-            # Calculate metrics
-            search_interest = self._calculate_recent_interest(df, brand)
-            trend_direction = self._detect_trend_direction(df, brand)
-            confidence_boost = self._calculate_confidence_boost(search_interest, trend_direction)
-            validates_signal = self._should_validate(search_interest, trend_direction)
-
-            result = {
-                'validates_signal': validates_signal,
-                'search_interest': round(search_interest, 4),
-                'trend_direction': trend_direction,
-                'confidence_boost': round(confidence_boost, 4),
-                'query_term': brand,
-                'timeframe': timeframe,
-                'error_message': None,
-                'raw_data': {
-                    'values': df[brand].tolist(),
-                    'dates': df.index.strftime('%Y-%m-%d').tolist(),
-                    'mean': float(df[brand].mean()),
-                    'std': float(df[brand].std())
-                }
-            }
-
-            logger.info(
-                f"[TRENDS] ✓ {brand}: interest={search_interest:.2f}, "
-                f"direction={trend_direction}, boost={confidence_boost:+.4f}, "
-                f"validates={validates_signal}"
-            )
-
-            # Cache successful result
-            if use_cache:
-                self.cache.set(brand, result)
-
-            return result
-
-        except Exception as e:
-            error_msg = f"API error: {str(e)}"
-            logger.error(f"[TRENDS] ✗ Failed to fetch '{brand}': {e}")
+        if error_msg:
             return self._error_result(brand, timeframe, error_msg)
+
+        if df is None or df.empty or brand not in df.columns:
+            logger.warning(f"[TRENDS] No data returned for '{brand}'")
+            return self._error_result(brand, timeframe, f"No search data for '{brand}'")
+
+        # Calculate metrics
+        search_interest = self._calculate_recent_interest(df, brand)
+        trend_direction = self._detect_trend_direction(df, brand)
+        confidence_boost = self._calculate_confidence_boost(search_interest, trend_direction)
+        validates_signal = self._should_validate(search_interest, trend_direction)
+
+        result = {
+            'validates_signal': validates_signal,
+            'search_interest': round(search_interest, 4),
+            'trend_direction': trend_direction,
+            'confidence_boost': round(confidence_boost, 4),
+            'query_term': brand,
+            'timeframe': timeframe,
+            'error_message': None,
+            'raw_data': {
+                'values': df[brand].tolist(),
+                'dates': df.index.strftime('%Y-%m-%d').tolist(),
+                'mean': float(df[brand].mean()),
+                'std': float(df[brand].std())
+            },
+            'validation_status': 'completed'
+        }
+
+        logger.info(
+            f"[TRENDS] ✓ {brand}: interest={search_interest:.2f}, "
+            f"direction={trend_direction}, boost={confidence_boost:+.4f}, "
+            f"validates={validates_signal}"
+        )
+
+        # Cache successful result
+        if use_cache:
+            self.cache.set(brand, result)
+
+        return result
 
     def _calculate_recent_interest(self, df: pd.DataFrame, brand: str) -> float:
         """
@@ -355,8 +496,22 @@ class GoogleTrendsValidator:
 
         return False
 
-    def _error_result(self, brand: str, timeframe: str, error_msg: str) -> Dict:
-        """Return neutral result when API fails (conservative fallback)."""
+    def _error_result(
+        self,
+        brand: str,
+        timeframe: str,
+        error_msg: str,
+        pending: bool = False
+    ) -> Dict:
+        """
+        Return neutral result when API fails.
+
+        Args:
+            brand: Brand name
+            timeframe: Timeframe used
+            error_msg: Error description
+            pending: If True, marks as pending for retry (non-blocking)
+        """
         return {
             'validates_signal': False,
             'search_interest': 0.0,
@@ -365,8 +520,55 @@ class GoogleTrendsValidator:
             'query_term': brand,
             'timeframe': timeframe,
             'error_message': error_msg,
-            'raw_data': None
+            'raw_data': None,
+            'validation_status': 'pending' if pending else 'failed'
         }
+
+
+def log_metrics():
+    """Log current metrics for monitoring."""
+    m = get_metrics()
+    total = m['total_requests']
+    if total == 0:
+        logger.info("[TRENDS-METRICS] No requests made yet")
+        return
+
+    success_rate = (m['successful_requests'] / total) * 100
+    failure_rate = (m['failed_requests'] / total) * 100
+    cache_rate = (m['cache_hits'] / (total + m['cache_hits'])) * 100 if (total + m['cache_hits']) > 0 else 0
+
+    logger.info(
+        f"[TRENDS-METRICS] Requests: {total} total, "
+        f"{m['successful_requests']} success ({success_rate:.1f}%), "
+        f"{m['failed_requests']} failed ({failure_rate:.1f}%), "
+        f"{m['rate_limited_requests']} rate-limited, "
+        f"{m['cache_hits']} cache hits ({cache_rate:.1f}%), "
+        f"{m['retry_attempts']} retry attempts"
+    )
+
+
+def validate_brand_non_blocking(
+    brand: str,
+    validator: 'GoogleTrendsValidator' = None,
+    use_cache: bool = True
+) -> Dict:
+    """
+    Non-blocking validation that returns pending status on rate limit errors.
+
+    Use this when trends validation should not block recommendation generation.
+    Rate-limited requests return validation_status='pending' instead of failing.
+    """
+    if validator is None:
+        validator = GoogleTrendsValidator()
+
+    result = validator.validate_brand_signal(brand, use_cache=use_cache)
+
+    # If rate-limited, mark as pending instead of failed
+    if result.get('error_message') and 'rate limit' in result['error_message'].lower():
+        result['validation_status'] = 'pending'
+        logger.info(f"[TRENDS] {brand}: marked as pending (rate limited, will retry later)")
+
+    return result
 
 
 # Module-level convenience function
